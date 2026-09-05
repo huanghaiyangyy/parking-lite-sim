@@ -154,14 +154,31 @@ class ModernGLFisheyeBackend:
         length_m = float(vcfg.get("length_m", 4.4))
         width_m = float(vcfg.get("width_m", 1.9))
         height_m = float(vcfg.get("height_m", 1.5))
+        rear_oh = vcfg.get("rear_overhang_m")
+        origin_fwd = 0.0
+        if rear_oh is not None:
+            origin_fwd = length_m * 0.5 - float(rear_oh)
+        wheelbase = vcfg.get("wheelbase_m")
+        wheelbase_m = float(wheelbase) if wheelbase is not None else None
 
-        self.ctx = moderngl.create_context(standalone=True)
+        try:
+            self.ctx = moderngl.create_context(standalone=True)
+        except Exception:
+            # Headless Linux: X11 DISPLAY may be set but unusable; EGL works on DRM.
+            self.ctx = moderngl.create_context(standalone=True, backend="egl")
         self.ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
 
         self._prog = self.ctx.program(vertex_shader=SCENE_VS, fragment_shader=SCENE_FS)
 
         lot_data = build_static_lot(self.assets_root)
-        ego_data = build_ego_mesh(length_m, width_m, height_m, self.assets_root)
+        ego_data = build_ego_mesh(
+            length_m,
+            width_m,
+            height_m,
+            self.assets_root,
+            origin_forward_offset_m=origin_fwd,
+            wheelbase_m=wheelbase_m,
+        )
 
         self._lot_vbo = self.ctx.buffer(lot_data.tobytes())
         self._lot_vao = self.ctx.vertex_array(

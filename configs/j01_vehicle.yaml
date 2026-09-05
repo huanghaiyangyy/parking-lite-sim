@@ -1,0 +1,19 @@
+# J01 kinematic control (VehicleOptions from production avm config.yaml)
+# Units: meters, seconds; angles in config are degrees.
+# Pose origin: rear-axle center, vehicle / world FLU.
+
+vehicle:
+  wheelbase_m: 2.800            # vehicle_wheelbase 2800 mm
+  track_width_m: 1.544          # mean of front 1543 / rear 1546 mm
+  steering_ratio: 15.3          # steering_angle_ratio
+  max_steer_wheel_deg: 500
+  max_road_wheel_deg: 35
+  max_accel_mps2: 2.0
+  max_decel_mps2: 4.0
+  max_speed_mps: 5.0
+  wheel_radius_m: 0.334         # wheel_diameter 668 mm
+  pulse_ticks_per_wheel_rev: 96
+  gear_map: {D: 1, R: -1, N: 0, P: 0}
+
+control:
+  dt_s: 0.02

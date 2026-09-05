@@ -22,3 +22,9 @@ Thumbs.db
 
 # Keep assets directory structure in git
 !assets/.gitkeep
+
+# Local J01 mesh from libavm.so (do not publish the extract)
+assets/vehicle/J01.obj
+assets/vehicle/J01.mtl
+assets/vehicle/parts.json
+assets/vehicle/tex

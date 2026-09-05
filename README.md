@@ -95,6 +95,21 @@ python scripts/run_demo.py
 |------|------|
 | `configs/default.yaml` | 场景、车辆尺寸、四相机 K/D/外参、BEV 范围、god_view、render |
 | `configs/vehicle.yaml` | 运动学控制参数（轴距、转向比、轮半径、脉冲等） |
+| `configs/j01.yaml` | **本车 J01**：Kannala–Brandt 内参 + VFF 平均外参，后轴原点 |
+| `configs/j01_vehicle.yaml` | J01 运动学（轴距 2.8 m、转向比 15.3、轮半径 0.334 m） |
+
+本车参数入口：
+
+```bash
+python scripts/run_demo.py --config configs/j01.yaml --out output/j01
+
+# 环绕自车看 J01 数模（无编辑器窗口；出 collage + GIF）
+python scripts/view_scene.py --config configs/j01.yaml --out output/j01_view
+
+# 可拖动的实时窗口（本机 GNOME 在 :1）
+./scripts/run_view_window.sh
+# 方向键开车，左键绕转，右键平移，滚轮缩放
+```
 
 `default.yaml` 中的 `vehicle_config:` 指向控制配置；场景里的 `vehicle:`（长宽高等）由 `World` 使用，两者职责分离。
 
@@ -112,6 +127,8 @@ cameras:
 ```
 
 修改 `K`/`D` 或外参后重新跑 `run_demo.py` / `run_phase2_fisheye.py` / `run_phase3_avm.py` 即可生效；无需改代码。
+
+`j01.yaml` 的 `vehicle.origin: rear_axle` 与量产 `extrinsic.txt` 一致：相机 `translation_m` 相对后轴中心，车身网格 / BEV ROI 用 `rear_overhang_m` 前移，不要再把后轴外参当成几何中心。
 
 ---
 

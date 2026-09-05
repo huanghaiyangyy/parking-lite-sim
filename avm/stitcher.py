@@ -64,9 +64,17 @@ def vehicle_roi_mask(
     length = float(vehicle_cfg.get("length_m", 4.4))
     width = float(vehicle_cfg.get("width_m", 1.9))
     xx, yy = bev_pixel_to_vehicle_xy(bev_cfg)
-    half_l = 0.5 * length + margin_m
     half_w = 0.5 * width + margin_m
-    return (np.abs(xx) <= half_l) & (np.abs(yy) <= half_w)
+    rear_oh = vehicle_cfg.get("rear_overhang_m")
+    if rear_oh is None:
+        half_l = 0.5 * length + margin_m
+        x_ok = np.abs(xx) <= half_l
+    else:
+        rear_oh = float(rear_oh)
+        x_min = -rear_oh - margin_m
+        x_max = (length - rear_oh) + margin_m
+        x_ok = (xx >= x_min) & (xx <= x_max)
+    return x_ok & (np.abs(yy) <= half_w)
 
 
 def _vehicle_to_opencv(

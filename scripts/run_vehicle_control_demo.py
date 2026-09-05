@@ -7,6 +7,7 @@ Writes CSV, trajectory plot, and a few god_view frames.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import math
 import sys
@@ -104,9 +105,32 @@ def _plot_trajectory(xs, ys, out_path: Path) -> None:
 
 
 def main() -> int:
-    vehicle_cfg = ROOT / "configs" / "vehicle.yaml"
-    scene_cfg = ROOT / "configs" / "default.yaml"
-    out_dir = ROOT / "output" / "vehicle_control"
+    parser = argparse.ArgumentParser(description="Kinematic vehicle control demo")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=ROOT / "configs" / "default.yaml",
+        help="Scene YAML (reads vehicle_config: for kinematics)",
+    )
+    parser.add_argument(
+        "--vehicle-config",
+        type=Path,
+        default=None,
+        help="Override kinematics YAML (default: scene vehicle_config or configs/vehicle.yaml)",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=ROOT / "output" / "vehicle_control",
+        help="Output directory",
+    )
+    args = parser.parse_args()
+
+    scene_cfg = args.config
+    world = World.from_config(scene_cfg)
+    rel = (world.config.get("vehicle_config") or "configs/vehicle.yaml")
+    vehicle_cfg = args.vehicle_config or (ROOT / rel)
+    out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Vehicle control demo")
@@ -118,7 +142,6 @@ def main() -> int:
     # Start near aisle origin, yaw 0 (facing +x)
     ctrl.reset(x=0.0, y=0.0, yaw=0.0, speed=0.0)
 
-    world = World.from_config(scene_cfg)
     world.set_ego_pose(0.0, 0.0, 0.0, 0.0)
 
     duration_s = 8.0

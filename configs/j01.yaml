@@ -1,0 +1,117 @@
+# J01 / 8155 舱泊一体 — 本车 Kannala–Brandt 四路鱼眼 + VFF 平均外参
+# Frame: vehicle FLU, origin = rear axle center (matches extrinsic.txt)
+# Camera K/D: EEPROM YAML (cv2.fisheye / Kannala–Brandt D=[k1,k2,k3,k4])
+# Extrinsics: VFF 7-group average, P_veh = R_cv @ P_opencv + t (t in mm → m)
+#
+# Sources (fawvw_apa_env):
+#   avm_projection/camera_params/{front,left,right,rear}_camera_calib.yaml
+#   avm_projection/avm_vff_avg.py  CALIB / VehicleOptions
+#   apa_docs/.../AVM全景影像分析.md  VehicleOptions
+#
+# Run: python scripts/run_demo.py --config configs/j01.yaml --out output/j01
+
+project:
+  name: parking-lite-j01
+  phase: 5
+  vehicle_id: j01
+  calib_set: vff_avg_7
+
+frame:
+  convention: vehicle_FLU
+  origin: rear_axle_center
+  description: "x forward, y left, z up; origin at rear-axle center (production calib)"
+
+vehicle:
+  length_m: 4.788
+  width_m: 1.868
+  height_m: 1.518
+  wheelbase_m: 2.800
+  front_overhang_m: 0.901
+  rear_overhang_m: 1.087
+  # geometric center is 1.307 m ahead of rear axle: length/2 - rear_overhang
+  origin: rear_axle
+  ego_pose:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    yaw_deg: 0.0
+
+image:
+  width: 1280
+  height: 960
+  alternate_width: 1024
+  alternate_height: 640
+
+render:
+  fisheye_mode: opencv
+  # Real fx≈313.6 → very wide KB FOV; pinhole capture still clips θ≥90°.
+  pinhole_fov_y_deg: 165.0
+  fisheye_fov_deg: 190.0
+  near: 0.05
+  far: 80.0
+
+god_view:
+  eye_flu: [18.0, -22.0, 28.0]
+  target_flu: [1.3, 0.0, 0.0]
+  up_flu: [0.0, 0.0, 1.0]
+  fov_y_deg: 55.0
+
+cameras:
+  # rotation_deg is sim intrinsic XYZ [roll, pitch, yaw] (cam-local X=optical fwd).
+  # Positive pitch looks toward ground in this Ry convention.
+  # K/D identical across four cameras on this vehicle (EEPROM copy).
+  front:
+    name: front
+    translation_m: [3.706827, -0.007727, 0.592542]
+    rotation_deg: [-1.4555, 20.8730, -0.2347]
+    K: [[313.615051, 0.0, 637.134766],
+        [0.0, 313.659821, 483.579956],
+        [0.0, 0.0, 1.0]]
+    D: [0.103936, 0.017695, -0.010846, -0.000101]
+
+  rear:
+    name: rear
+    translation_m: [-1.074920, 0.040276, 0.802915]
+    rotation_deg: [0.1119, 31.4497, -179.9763]
+    K: [[313.615051, 0.0, 637.134766],
+        [0.0, 313.659821, 483.579956],
+        [0.0, 0.0, 1.0]]
+    D: [0.103936, 0.017695, -0.010846, -0.000101]
+
+  left:
+    name: left
+    translation_m: [2.050266, 1.044171, 1.020553]
+    rotation_deg: [-0.6427, 29.8387, 93.1715]
+    K: [[313.615051, 0.0, 637.134766],
+        [0.0, 313.659821, 483.579956],
+        [0.0, 0.0, 1.0]]
+    D: [0.103936, 0.017695, -0.010846, -0.000101]
+
+  right:
+    name: right
+    translation_m: [2.028323, -1.036311, 1.025203]
+    rotation_deg: [-0.5542, 29.6786, -92.7884]
+    K: [[313.615051, 0.0, 637.134766],
+        [0.0, 313.659821, 483.579956],
+        [0.0, 0.0, 1.0]]
+    D: [0.103936, 0.017695, -0.010846, -0.000101]
+
+bev:
+  # Production AVM canvas 12800×12800 mm @ 25 mm/px, center = geometric center.
+  # Converted to rear-axle origin: fwd = 6.4+1.307, back = 6.4-1.307.
+  forward_m: 7.707
+  back_m: 5.093
+  left_m: 6.400
+  right_m: 6.400
+  resolution_m_per_px: 0.025
+
+scene:
+  type: procedural_lot
+  placeholder: false
+  assets_root: assets
+
+frames:
+  count: 1
+  dt_s: 0.033
+
+vehicle_config: configs/j01_vehicle.yaml
