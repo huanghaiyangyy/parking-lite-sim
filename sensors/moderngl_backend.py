@@ -114,6 +114,19 @@ def _mat4_bytes(m: glm.mat4) -> bytes:
     return np.array(m, dtype="f4").T.tobytes()
 
 
+def look_at_view(eye, target, up) -> glm.mat4:
+    """View matrix that keeps vehicle-left on the left of the image.
+
+    glm.lookAt's side vector is forward × up. With this scene's +Z-forward
+    cameras that puts vehicle-left on the right side of the framebuffer.
+    Negate that row. Callers draw with front face CW so culling still matches.
+    """
+    view = glm.lookAt(glm.vec3(*eye), glm.vec3(*target), glm.vec3(*up))
+    for col in range(4):
+        view[col][0] *= -1
+    return view
+
+
 def flu_ego_model(x: float, y: float, z: float, yaw_rad: float) -> glm.mat4:
     """Model matrix: local GL ego mesh → world GL from world-FLU pose."""
     t = glm.vec3(-y, z, x)
@@ -167,6 +180,8 @@ class ModernGLFisheyeBackend:
             # Headless Linux: X11 DISPLAY may be set but unusable; EGL works on DRM.
             self.ctx = moderngl.create_context(standalone=True, backend="egl")
         self.ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+        # look_at_view reflects X; clockwise faces are the outside.
+        self.ctx.front_face = "cw"
 
         self._prog = self.ctx.program(vertex_shader=SCENE_VS, fragment_shader=SCENE_FS)
 
@@ -261,7 +276,7 @@ class ModernGLFisheyeBackend:
         target: Sequence[float],
         up: Sequence[float],
     ) -> np.ndarray:
-        view = glm.lookAt(glm.vec3(*eye), glm.vec3(*target), glm.vec3(*up))
+        view = look_at_view(eye, target, up)
         self._draw_scene(self._proj_fisheye_pinhole, view, eye)
         return self._read_fbo_rgb(self._fbo)
 
@@ -323,7 +338,7 @@ class ModernGLFisheyeBackend:
         if self._released:
             raise RuntimeError("ModernGLFisheyeBackend already released")
         proj = glm.perspective(glm.radians(float(fov_y_deg)), self.aspect, near, far)
-        view = glm.lookAt(glm.vec3(*eye), glm.vec3(*target), glm.vec3(*up))
+        view = look_at_view(eye, target, up)
         self._draw_scene(proj, view, eye)
         return self._read_fbo_rgb(self._fbo)
 
