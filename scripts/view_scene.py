@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -199,6 +200,107 @@ def _pan_axes(eye, target, up=(0.0, 0.0, 1.0)):
     return right, up_cam
 
 
+class _GodViewProxy:
+    """Render in children that do not touch the X display.
+
+    pygame and ModernGL cannot share a process here (the window stays black).
+    God view and the fisheye rig also cannot share a process: two framebuffer
+    sizes on one GL context make the readback shear into stripes.
+    """
+
+    def __init__(self, config: Path):
+        self.god = self._open("god", config)
+        self.cams = self._open("cams", config)
+        ready = self.cams.stdout.readline()
+        parts = ready.decode(errors="replace").split()
+        if not parts or parts[0] != "ready":
+            raise RuntimeError("camera worker failed to start: %r" % ready)
+        self.cam_names = tuple(parts[1:]) or ("front", "rear", "left", "right")
+        got = self.god.stdout.readline()
+        if got.strip() != b"ready":
+            raise RuntimeError("god worker failed to start: %r" % got)
+
+    @staticmethod
+    def _open(mode: str, config: Path) -> subprocess.Popen:
+        env = os.environ.copy()
+        env.pop("DISPLAY", None)
+        env.pop("WAYLAND_DISPLAY", None)
+        proc = subprocess.Popen(
+            [sys.executable, str(ROOT / "scripts" / "view_render_worker.py")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            env=env,
+        )
+        assert proc.stdin is not None
+        proc.stdin.write(("%s\n%s\n" % (mode, config)).encode())
+        proc.stdin.flush()
+        return proc
+
+    @staticmethod
+    def _read_frame(proc: subprocess.Popen) -> np.ndarray:
+        assert proc.stdout is not None
+        header = proc.stdout.read(12)
+        if len(header) != 12:
+            raise RuntimeError("render worker closed")
+        w, h, nbytes = struct.unpack("<III", header)
+        buf = bytearray()
+        while len(buf) < nbytes:
+            chunk = proc.stdout.read(nbytes - len(buf))
+            if not chunk:
+                raise RuntimeError("render worker closed mid-frame")
+            buf.extend(chunk)
+        return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
+
+    @staticmethod
+    def _send(proc: subprocess.Popen, line: str) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(line.encode())
+        proc.stdin.flush()
+
+    def render(
+        self,
+        ego,
+        eye,
+        target,
+        fov: float,
+    ) -> np.ndarray:
+        vals = [
+            float(ego["x"]),
+            float(ego["y"]),
+            float(ego["z"]),
+            float(ego["yaw"]),
+            float(eye[0]),
+            float(eye[1]),
+            float(eye[2]),
+            float(target[0]),
+            float(target[1]),
+            float(target[2]),
+            0.0,
+            float(fov),
+        ]
+        self._send(self.god, " ".join("%.6f" % v for v in vals) + "\n")
+        return self._read_frame(self.god)
+
+    def render_cameras(self, ego) -> dict:
+        vals = [float(ego["x"]), float(ego["y"]), float(ego["z"]), float(ego["yaw"])]
+        self._send(self.cams, " ".join("%.6f" % v for v in vals) + "\n")
+        return {name: self._read_frame(self.cams) for name in self.cam_names}
+
+    def close(self) -> None:
+        for proc in (self.god, self.cams):
+            if proc.poll() is not None:
+                continue
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write(b"quit\n")
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+
+
 def try_interactive(world: World, size=(1280, 800)) -> int:
     """Draggable orbit window. LMB orbit, RMB pan, wheel zoom."""
     try:
@@ -216,10 +318,13 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
     os.environ.setdefault("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "0")
     pygame.init()
     pygame.display.set_caption(
-        "parking-lite — arrows drive  |  LMB orbit  |  RMB pan  |  wheel zoom"
+        "parking-lite — arrows drive  |  LMB orbit  |  RMB pan  |  wheel zoom  |  C cameras"
     )
+    god_w, god_h = size
+    cam_strip_h = 220
+    win_w, win_h = god_w, god_h + cam_strip_h
     try:
-        screen = pygame.display.set_mode(size)
+        screen = pygame.display.set_mode((win_w, win_h), pygame.SWSURFACE)
     except pygame.error as exc:
         print("  pygame.display.set_mode failed:", exc)
         pygame.quit()
@@ -248,10 +353,16 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
     dragging_orbit = False
     dragging_pan = False
     dirty = True
+    show_cams = True
     clock = pygame.time.Clock()
-    win_w, win_h = size
     print("  window %dx%d on DISPLAY=%s" % (win_w, win_h, os.environ.get("DISPLAY")))
-    print("  arrows = drive car, LMB orbit, RMB pan, wheel zoom, F follow, R reset")
+    print("  arrows = drive, LMB orbit, RMB pan, wheel zoom, F follow, R reset, C cameras")
+    try:
+        renderer = _GodViewProxy(Path(world.config_path))
+    except Exception as exc:
+        print("  live window skipped:", exc)
+        pygame.quit()
+        return 2
 
     def look_at() -> np.ndarray:
         base = np.array(_ego_target_flu(world), dtype=np.float64)
@@ -262,20 +373,49 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
     def render_frame() -> np.ndarray:
         tgt = look_at()
         eye = orbit_eye(tuple(tgt), az, el, radius)
-        return world.render_god_view(
-            eye_flu=eye,
-            target_flu=tuple(tgt),
-            up_flu=(0.0, 0.0, 1.0),
-            fov_y_deg=fov,
-        )
+        return renderer.render(world.ego_pose, eye, tuple(tgt), fov)
+
+    def rgb_surface(arr: np.ndarray, size=None) -> "pygame.Surface":
+        # 24-bit RGB blits onto this 32-bit window with the wrong pitch and
+        # shows as stripes. Copy into a surface that matches the display.
+        if size is not None and (arr.shape[1], arr.shape[0]) != size:
+            src = Image.fromarray(np.ascontiguousarray(arr), "RGB")
+            arr = np.asarray(src.resize(size, Image.Resampling.BILINEAR))
+        h, w = arr.shape[:2]
+        surf = pygame.Surface((w, h)).convert()
+        pygame.surfarray.blit_array(surf, np.transpose(arr, (1, 0, 2)))
+        return surf
+
+    def render_cam_strip() -> pygame.Surface:
+        images = renderer.render_cameras(world.ego_pose)
+        names = list(renderer.cam_names)
+        cell_w = god_w // max(1, len(names))
+        strip = pygame.Surface((god_w, cam_strip_h))
+        strip.fill((12, 12, 14))
+        label_font = font
+        for i, name in enumerate(names):
+            ch, cw = images[name].shape[:2]
+            # Fit inside the cell, keep aspect, leave a label row.
+            label_h = 18
+            avail_h = cam_strip_h - label_h - 4
+            scale = min((cell_w - 4) / cw, avail_h / ch)
+            tw, th = max(1, int(cw * scale)), max(1, int(ch * scale))
+            surf = rgb_surface(images[name], (tw, th))
+            x0 = i * cell_w + (cell_w - tw) // 2
+            strip.blit(surf, (x0, label_h))
+            tag = label_font.render(name, True, (255, 230, 80), (0, 0, 0))
+            strip.blit(tag, (i * cell_w + 6, 1))
+        return strip
 
     img = render_frame()
+    cam_strip = render_cam_strip() if show_cams else None
     running = True
     while running:
         dt = clock.get_time() / 1000.0
         if dt <= 0.0:
             dt = 1.0 / 60.0
-        dt = min(dt, 0.05)
+        # A slow fisheye frame must still move the car by the time that passed.
+        dt = min(dt, 0.25)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -310,8 +450,11 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
                 elif event.key == pygame.K_e:
                     look_offset[2] += 0.3
                     dirty = True
-                elif event.key == pygame.K_c:
+                elif event.key == pygame.K_x:
                     look_offset[2] -= 0.3
+                    dirty = True
+                elif event.key == pygame.K_c:
+                    show_cams = not show_cams
                     dirty = True
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
@@ -384,17 +527,18 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
 
         if dirty:
             img = render_frame()
+            if show_cams:
+                cam_strip = render_cam_strip()
             dirty = False
 
-        h, w = img.shape[:2]
-        buf = img.tobytes()
-        surf = pygame.image.frombuffer(buf, (w, h), "RGB")
-        if (w, h) != (win_w, win_h):
-            surf = pygame.transform.smoothscale(surf, (win_w, win_h))
+        surf = rgb_surface(img, (god_w, god_h))
+        screen.fill((8, 8, 10))
         screen.blit(surf, (0, 0))
+        if show_cams and cam_strip is not None:
+            screen.blit(cam_strip, (0, god_h))
         hud = [
-            "Arrows drive  Space brake  LMB orbit  RMB pan  wheel zoom  F follow=%s  R reset"
-            % ("on" if follow else "off"),
+            "Arrows drive  Space brake  LMB orbit  RMB pan  wheel zoom  F follow=%s  C cams=%s  R reset"
+            % ("on" if follow else "off", "on" if show_cams else "off"),
             "gear %s  v=%+.2f m/s  steer=%+.0f  yaw=%.0f  xy=(%.2f, %.2f)  %.0f fps"
             % (
                 st.gear,
@@ -414,6 +558,7 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
         pygame.display.flip()
         clock.tick(60)
 
+    renderer.close()
     pygame.quit()
     print("  window closed")
     return 0
@@ -440,8 +585,6 @@ def main(argv=None) -> int:
 
     world = World.from_config(args.config)
     world.set_ego_pose(0.5, 1.5, 0.0, math.radians(28.0))
-    backend = world.rig.ensure_backend()
-    print("  GL:", backend.gl_info)
     ego = world.rig.vehicle_cfg
     print(
         "  ego mesh: J01.obj"
@@ -452,8 +595,10 @@ def main(argv=None) -> int:
 
     if args.window:
         rc = try_interactive(world)
-        world.release()
         return rc
+
+    backend = world.rig.ensure_backend()
+    print("  GL:", backend.gl_info)
 
     # Close 3/4 rear-right, similar to the libavm contact sheet
     target = _ego_target_flu(world)
