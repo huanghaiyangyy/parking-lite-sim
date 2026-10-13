@@ -18,7 +18,7 @@
 
 - **程序性停车场场景** + 动态自车网格（lot / ego）
 - **四路鱼眼**（front / rear / left / right），YAML 配置 `K`、`D`、外参
-- **OpenCV Kannala–Brandt** 真鱼眼成像（宽 FOV pinhole → LUT → `cv2.remap`）
+- **OpenCV Kannala–Brandt** 真鱼眼成像（宽 FOV pinhole → 原 KB LUT → GPU remap，与 OpenCV 逐像素核对）
 - **AVM / BEV 拼接**：地面 IPM + feather 融合，自车车身 ROI 遮罩
 - **God view**：世界固定针孔俯视概览
 - **Phase 4 校验**：内参一致性、地标对齐、接缝 MAD、外参扰动敏感度
@@ -252,3 +252,66 @@ parking-lite-demo/
 ## License
 
 MIT License — 见 [LICENSE](LICENSE)。Copyright (c) 2026。
+
+## H264 四路输入
+
+`World.render_camera_grid()` 在 GPU 直接生成 `front|left / right|rear` 的 2×2 拼图，只读回一次。原 `render_cameras()` 字典接口保留；KB LUT、K/D、FOV 和外参继续使用现有配置。GPU 按 OpenCV INTER_LINEAR 的 1/32 像素权重与整数舍入采样，invalid 区域为黑。
+
+用交互窗口控制板端视频，先按板端工具说明启用视频输入，再启动：
+
+```bash
+rtk proxy bash scripts/run_view_window.sh \
+  --stream-adb --serial 5e9350b6 --fps 10 --bitrate 12M --capture-scale 4
+```
+
+窗口驾驶更新相机进程的车辆状态，相机独立按 10 fps 采样和编码；每帧只生成一次全分辨率四路画面，窗口读取同一批图像的最新预览。预览带来源序号和采样位姿，可与对应编码帧核对。停车、隐藏预览时也持续发送；关闭窗口停止发送。上下方向键前进 / 倒车，左右键转向，空格制动，R 回到初始位置。鼠标拖动与缩放只改变主机观察视角。该模式只需启动窗口；同时运行独立发送进程会争用同一个接收连接。
+
+窗口 `Board SEND` 行显示成功发送的累计 AU 数及最近约一秒的实际 fps / Mbps，同时列出目标帧率 / 码率。它统计主机 TCP 发送完成，不代表板端解码或屏幕刷新帧率。`check_window_stream.py` 放慢预览请求，核对来源帧并验证视频仍为 10 fps；吞吐检查排除硬件编码器冷启动，应关闭另一个发送窗口后运行。
+
+联动模式的概览也按相机节拍更新；未变化的大图缓存为显示 surface，减少重复渲染、缩放和像素复制给视频发送造成的额外开销。ADB 建立转发时的端口号输出已隔离，避免污染相机进程的二进制通信；无板端自检包含这个启动场景。
+
+`--capture-scale 1|2|4` 只提高内部针孔捕获尺寸，输出 K/D、FOV 和四路 1280×960 保持一致。4× 在 GPU 上生成 5120×3840 中间图，直接映射到最终鱼眼，仍只读回最终拼图。中间缓冲按需创建，主机概览仍按原尺寸渲染。当前主机四路出图 P95：1× 16.6 ms、2× 23.9 ms、4× 27.2 ms，4× 的轮廓和车位线更清楚。早期窗口驱动采样在桌面负载下运动时降至约 9.49 fps，现采样 / 编码与预览读写分离；最终实机 25 秒驾驶约 9.99 fps，持续链路约 10.00 fps，板端接收 / 解码 / 发布一致。保持总码率 12M。`--capture-scale 1` 为原采样方式。
+
+```bash
+rtk proxy .venv/bin/python scripts/check_gpu_fisheye.py --capture-scale 4 --frames 8
+rtk proxy .venv/bin/python scripts/check_window_stream.py --capture-scale 4
+```
+
+`rtk proxy .venv/bin/python scripts/check_window_stream.py` 可独立检查 8 个指定车辆位姿，核对预览与源图像像素、完整 H264 帧及解码后的场景，无需板端。
+
+下面的独立发送命令使用脚本自身的自动运动，与不带 `--stream-adb` 的窗口各自运行：
+
+```bash
+rtk proxy .venv/bin/python scripts/check_gpu_fisheye.py
+rtk proxy .venv/bin/python scripts/stream_h264_adb.py \
+  --serial 5e9350b6 --scale 1 --fps 10 --seconds 60
+```
+
+发送前会预热 GL shader 和 LUT，再给实时帧赋 PTS。流通过 Android 字节转发进入 QNX 解码器，保留两端 AIS/QCarCam 输入；板端启动与恢复见 [ais_camera_tools 说明](/home/huang/fawvw_apa_env/src/tools/ais_camera_tools/stream/README.md)。
+
+持续查看板端时使用 `--seconds 0 --loop-motion`：车辆在场内平滑往返，最大速度 0.4 m/s、周期约 63 秒，四路画面持续变化。可先用 `--loop-motion --seconds 2 --file output/loop_smoke.plit` 检查真实仿真出图和编码。
+
+当前全分辨率同条件出图均值约 14.5 ms（CPU 参考约 37.7 ms），120 秒实流发送、解码和发布 1198 帧。测试范围与资源记录见 [验证报告](/home/huang/work/ais-video-converge-20261012/validation_report.md)。
+
+延迟诊断可用 `--sequence-pattern --frame-log output/frames.jsonl`：四路输入使用相同的逐帧颜色编码，记录生成与发送的主机单调时间。`scripts/check_stream_latency.py` 检查 36 个主画面点与四个俯视区，并通过 Android uptime 与主机 RPC 时间边界校准时钟。512 个颜色在 10 fps 下每 51.2 秒重复，适用于本链路的短延迟诊断。
+
+在发送脚本持续运行期间，另一终端执行：
+
+```bash
+rtk proxy .venv/bin/python scripts/check_stream_latency.py \
+  --source-log output/frames.jsonl --out output/screen_clock --samples 3
+rtk proxy adb -s 5e9350b6 shell su 0 screenrecord \
+  --bugreport --time-limit 60 --size 2560x1440 --bit-rate 8000000 \
+  /data/local/tmp/avm_latency.mp4
+rtk proxy adb -s 5e9350b6 pull /data/local/tmp/avm_latency.mp4 output/avm_latency.mp4
+rtk proxy .venv/bin/python scripts/check_stream_latency.py \
+  --source-log output/frames.jsonl --video output/avm_latency.mp4 \
+  --clock-calibration output/screen_clock/results.json --out output/video_latency
+rtk proxy .venv/bin/python scripts/check_stream_latency.py --self-test
+```
+
+单张截图只给出画面新鲜度的时间区间。连续录像使用 Android 11 `screenrecord` 内嵌的 Winscope 逐帧 elapsed 时间戳，给出首次观察与显示切换的 P95 区间；终点是 SurfaceFlinger 虚拟显示，不包含物理屏幕扫描。结果不会把录像相对 PTS 当成主机时间。
+
+较长录像可在结束后再采一次时钟，给 `--clock-calibration` 同时传入录像前后的两个 `results.json`，保留漂移与 RPC 的不确定区间。当前 600 秒真实流发送 / 解码 / 发布 5989 帧；60 秒显示录像有 5 处未录到的源序号，严格检查返回非零，尚未计作无跳帧验收。记录见 [2026-10-13 报告](/home/huang/work/ais-video-latency-20261013/validation_report.md)。
+
+板端启动工具现默认采用无 B 帧码流的 `DisplayPictureBuffer=1`，到达至发布中位耗时约 130→29 ms；关闭逐帧日志后，60 秒录像首次观察 P95 为 210–238 ms，仍有 3 个源序号未录到。原厂 AIS / QCarCam 与算法链保留，最新边界与证据见 [后续优化报告](/home/huang/work/ais-video-default-20261013/validation_report.md)。

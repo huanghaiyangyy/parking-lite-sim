@@ -13,9 +13,13 @@ Commands (one line each):
 
 from __future__ import annotations
 
+import argparse
 import os
+import socket
 import struct
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -80,7 +84,111 @@ def _scaled_rig(world: World, scale: float):
     )
 
 
+def stream_cameras(world, args):
+    """Own the GL/encoder cadence; a slow preview consumer cannot delay video."""
+    import cv2
+    from stream_h264_adb import Encoder, SEND_STATUS, connect_adb
+    cv2.setNumThreads(2)
+    width, height = world.rig.image_size
+    if (width, height) != (1280, 960):
+        raise ValueError("board streaming requires 1280x960 per camera")
+    world.render_camera_grid()
+    sock = (socket.create_connection((args.host, args.port), timeout=10)
+            if args.host else connect_adb(args.serial, args.port))
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.settimeout(10)
+    encoder = Encoder(width*2, height*2, args.fps, args.bitrate, sock.sendall)
+    condition, stopped = threading.Condition(), threading.Event()
+    pose, snapshot = None, None
+
+    def preview_io():
+        nonlocal pose
+        try:
+            while not stopped.is_set():
+                line = _readline()
+                if line == "quit":
+                    break
+                requested = tuple(float(v) for v in line.split())
+                if len(requested) != 4:
+                    raise ValueError("camera command requires x y z yaw")
+                with condition:
+                    pose = requested
+                    condition.notify_all()
+                    condition.wait_for(lambda: snapshot is not None or stopped.is_set())
+                    if stopped.is_set():
+                        break
+                    images, status = snapshot
+                for name in world.rig.names:
+                    _write_frame(images[name])
+                sys.stdout.buffer.write(SEND_STATUS.pack(*status))
+                sys.stdout.buffer.flush()
+        except (EOFError, BrokenPipeError):
+            pass
+        finally:
+            stopped.set()
+            with condition:
+                condition.notify_all()
+
+    io = threading.Thread(target=preview_io, daemon=True)
+    sys.stdout.buffer.write(("ready %s\n" % " ".join(world.rig.names)).encode())
+    sys.stdout.buffer.flush()
+    io.start()
+    try:
+        with condition:
+            condition.wait_for(lambda: pose is not None or stopped.is_set())
+        start_ns, report, seq = time.monotonic_ns(), time.monotonic(), 0
+        next_frame = time.monotonic()
+        report_sent, report_bytes, send_fps, send_mbps = 0, 0, 0.0, 0.0
+        while not stopped.wait(max(0, next_frame-time.monotonic())):
+            with condition:
+                captured_pose = pose
+            tick_ns = time.monotonic_ns()
+            world.set_ego_pose(*captured_pose)
+            grid = world.render_camera_grid()
+            encoder.push(seq, (tick_ns-start_ns)//1000, grid)
+            images = {name: cv2.resize(grid[row*height:(row+1)*height,
+                                          col*width:(col+1)*width],
+                                      (width//2, height//2), interpolation=cv2.INTER_AREA)
+                      for name, (row, col) in dict(front=(0, 0), left=(0, 1),
+                                                 right=(1, 0), rear=(1, 1)).items()}
+            now = time.monotonic()
+            if now-report >= 1:
+                send_fps = (encoder.sent-report_sent)/(now-report)
+                send_mbps = (encoder.bytes-report_bytes)*8/(now-report)/1e6
+                print(f"window_stream rendered={seq+1} sent={encoder.sent} "
+                      f"send_fps={send_fps:.2f} Mbps={send_mbps:.2f} "
+                      f"report_time={now:.6f} pose={list(captured_pose)}", file=sys.stderr, flush=True)
+                report, report_sent, report_bytes = now, encoder.sent, encoder.bytes
+            with condition:
+                snapshot = images, (encoder.sent, send_fps, send_mbps, seq, *captured_pose)
+                condition.notify_all()
+            seq += 1
+            next_frame = max(next_frame+1/args.fps, time.monotonic())
+        encoder.finish()
+    finally:
+        stopped.set()
+        with condition:
+            condition.notify_all()
+        io.join(timeout=1)
+        if encoder.proc.poll() is None:
+            encoder.proc.kill(); encoder.proc.wait()
+        sock.close()
+        world.release()
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stream-adb", action="store_true")
+    parser.add_argument("--serial", default="")
+    parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--bitrate", default="12M")
+    parser.add_argument("--host", help="direct TCP destination for the stream")
+    parser.add_argument("--port", type=int, default=27164)
+    parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4))
+    args = parser.parse_args()
+    if not 1 <= args.fps <= 30:
+        parser.error("fps must be 1..30")
     # One mode per process. A second ModernGL context in this process (full-res
     # god view plus half-res fisheye) makes fbo.read come back sheared.
     mode = _readline()
@@ -114,26 +222,32 @@ def main() -> int:
 
     if mode == "cams":
         world = World.from_config(config)
+        if args.capture_scale is not None:
+            world.rig.render_cfg["pinhole_capture_scale"] = args.capture_scale
+        if args.stream_adb:
+            return stream_cameras(world, args)
+        names = tuple(world.rig.names)
         preview = _scaled_rig(world, _PREVIEW_SCALE)
         world.release()
-        names = tuple(preview.names)
-        sys.stdout.buffer.write(("ready %s\n" % " ".join(names)).encode())
-        sys.stdout.buffer.flush()
-        while True:
-            try:
-                line = _readline()
-            except EOFError:
-                break
-            if line == "quit":
-                break
-            parts = [float(x) for x in line.split()]
-            if len(parts) != 4:
-                continue
-            images = preview.render_cameras(tuple(parts))
-            for name in names:
-                _write_frame(images[name])
+        try:
+            sys.stdout.buffer.write(("ready %s\n" % " ".join(names)).encode())
             sys.stdout.buffer.flush()
-        preview.release()
+            while True:
+                try:
+                    line = _readline()
+                except EOFError:
+                    break
+                if line == "quit":
+                    break
+                parts = [float(x) for x in line.split()]
+                if len(parts) != 4:
+                    continue
+                images = preview.render_cameras(tuple(parts))
+                for name in names:
+                    _write_frame(images[name])
+                sys.stdout.buffer.flush()
+        finally:
+            preview.release()
         return 0
 
     sys.stderr.write("view_render_worker: expected god or cams, got %r\n" % mode)

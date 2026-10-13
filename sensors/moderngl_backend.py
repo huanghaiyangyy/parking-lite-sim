@@ -9,11 +9,10 @@ from typing import Optional, Sequence, Tuple
 import glm
 import moderngl
 import numpy as np
-from PIL import Image
 
 from scene.ego_vehicle import build_ego_mesh
 from scene.lot import build_static_lot
-from sensors.fisheye_opencv import remap_pinhole_to_fisheye
+from sensors.fisheye_opencv import build_fisheye_from_pinhole_maps
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -109,6 +108,40 @@ void main() {
 }
 """
 
+# Reuse the CPU Kannala–Brandt LUT. Match OpenCV INTER_LINEAR's 1/32-pixel
+# coordinates and integer rounding, including black invalid samples.
+KB_FISHEYE_FS = """
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform sampler2D u_map;
+out vec4 f_color;
+ivec3 pixel(ivec2 p) {
+    ivec2 size = textureSize(u_tex, 0);
+    p = clamp(p, ivec2(0), size - 1);
+    p.y = size.y - 1 - p.y;
+    return ivec3(round(texelFetch(u_tex, p, 0).rgb * 255.0));
+}
+void main() {
+    ivec2 size = textureSize(u_map, 0);
+    ivec2 output_pixel = ivec2(v_uv * vec2(size));
+    output_pixel.y = size.y - 1 - output_pixel.y;
+    vec2 p = texelFetch(u_map, output_pixel, 0).rg;
+    if (p.x < 0.0 || p.y < 0.0) {
+        f_color = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    ivec2 q = ivec2(roundEven(p * 32.0));
+    ivec2 base = q / 32;
+    ivec2 f = q - base * 32;
+    ivec3 value = pixel(base) * (32-f.x) * (32-f.y)
+        + pixel(base+ivec2(1,0)) * f.x * (32-f.y)
+        + pixel(base+ivec2(0,1)) * (32-f.x) * f.y
+        + pixel(base+ivec2(1,1)) * f.x * f.y;
+    f_color = vec4(vec3((value + 512) / 1024) / 255.0, 1.0);
+}
+"""
+
 
 def _mat4_bytes(m: glm.mat4) -> bytes:
     return np.array(m, dtype="f4").T.tobytes()
@@ -136,8 +169,8 @@ def flu_ego_model(x: float, y: float, z: float, yaw_rad: float) -> glm.mat4:
 class ModernGLFisheyeBackend:
     """Offscreen renderer with static lot VAO + dynamic ego VAO.
 
-    Default fisheye path (Phase 2): wide pinhole FBO → OpenCV Kannala–Brandt
-    LUT (config K/D) → cv2.remap. Legacy equidistant GPU remap still available
+    Default fisheye path: wide pinhole FBO → OpenCV Kannala–Brandt
+    LUT (config K/D) → GPU remap. Legacy equidistant GPU remap still available
     via fisheye_mode='equidistant'.
     """
 
@@ -152,9 +185,14 @@ class ModernGLFisheyeBackend:
         fisheye_mode: str = "opencv",
         near: float = 0.05,
         far: float = 80.0,
+        pinhole_capture_scale: int = 1,
     ):
         self.width = int(width)
         self.height = int(height)
+        if pinhole_capture_scale not in (1, 2, 4):
+            raise ValueError("pinhole_capture_scale must be 1, 2, or 4")
+        self.capture_width = self.width * pinhole_capture_scale
+        self.capture_height = self.height * pinhole_capture_scale
         self.pinhole_fov_y_deg = float(pinhole_fov_y_deg)
         self.fisheye_fov = math.radians(float(fisheye_fov_deg))
         self.aspect = self.width / self.height
@@ -211,6 +249,8 @@ class ModernGLFisheyeBackend:
         self._fbo = self.ctx.framebuffer(
             color_attachments=[self._color_tex], depth_attachment=depth_rb
         )
+        self._capture_fbo = None
+        self._capture_tex = None
 
         self._fish_tex = self.ctx.texture((self.width, self.height), 3)
         self._fish_fbo = self.ctx.framebuffer(color_attachments=[self._fish_tex])
@@ -224,6 +264,12 @@ class ModernGLFisheyeBackend:
         self._fish_vao = self.ctx.vertex_array(
             self._fish_prog, [(quad_vbo, "2f 2f", "in_vert", "in_uv")]
         )
+        self._kb_prog = self.ctx.program(vertex_shader=FISHEYE_VS, fragment_shader=KB_FISHEYE_FS)
+        self._kb_vao = self.ctx.vertex_array(
+            self._kb_prog, [(quad_vbo, "2f 2f", "in_vert", "in_uv")]
+        )
+        self._kb_maps = {}
+        self._grid_fbo = None
         self._color_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self._color_tex.repeat_x = False
         self._color_tex.repeat_y = False
@@ -247,9 +293,22 @@ class ModernGLFisheyeBackend:
         """Update dynamic ego model matrix from world-FLU pose."""
         self._ego_model = flu_ego_model(x, y, z, yaw_rad)
 
-    def _draw_scene(self, proj: glm.mat4, view: glm.mat4, eye: Sequence[float]) -> None:
-        self._fbo.use()
-        self.ctx.viewport = (0, 0, self.width, self.height)
+    def _ensure_capture(self) -> None:
+        if self._capture_fbo is None:
+            if (self.capture_width, self.capture_height) == (self.width, self.height):
+                self._capture_fbo, self._capture_tex = self._fbo, self._color_tex
+            else:
+                size = (self.capture_width, self.capture_height)
+                self._capture_tex = self.ctx.texture(size, 3)
+                self._capture_fbo = self.ctx.framebuffer(color_attachments=[self._capture_tex],
+                                                       depth_attachment=self.ctx.depth_renderbuffer(size))
+                self._capture_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self._capture_tex.repeat_x = self._capture_tex.repeat_y = False
+
+    def _draw_scene(self, proj: glm.mat4, view: glm.mat4, eye: Sequence[float], fbo=None) -> None:
+        target = self._fbo if fbo is None else fbo
+        target.use()
+        self.ctx.viewport = (0, 0, *target.size)
         self.ctx.clear(0.28, 0.30, 0.33, 1.0)
         self._prog["u_light_dir"].value = self._light_dir
         self._prog["u_cam_pos"].value = (float(eye[0]), float(eye[1]), float(eye[2]))
@@ -265,10 +324,8 @@ class ModernGLFisheyeBackend:
 
     def _read_fbo_rgb(self, fbo) -> np.ndarray:
         data = fbo.read(components=3, alignment=1)
-        img = Image.frombytes("RGB", (self.width, self.height), data).transpose(
-            Image.FLIP_TOP_BOTTOM
-        )
-        return np.asarray(img, dtype=np.uint8)
+        width, height = fbo.size
+        return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)[::-1].copy()
 
     def _render_wide_pinhole(
         self,
@@ -277,22 +334,49 @@ class ModernGLFisheyeBackend:
         up: Sequence[float],
     ) -> np.ndarray:
         view = look_at_view(eye, target, up)
-        self._draw_scene(self._proj_fisheye_pinhole, view, eye)
-        return self._read_fbo_rgb(self._fbo)
+        self._ensure_capture()
+        self._draw_scene(self._proj_fisheye_pinhole, view, eye, self._capture_fbo)
+        return self._read_fbo_rgb(self._capture_fbo)
 
-    def _remap_equidistant_gpu(self) -> np.ndarray:
-        self._fish_fbo.use()
-        self.ctx.viewport = (0, 0, self.width, self.height)
-        self.ctx.clear(0.0, 0.0, 0.0, 1.0)
-        self._color_tex.use(location=0)
-        self._fish_prog["u_tex"].value = 0
-        self._fish_prog["u_pinhole_fov_y"].value = math.radians(self.pinhole_fov_y_deg)
-        self._fish_prog["u_fisheye_fov"].value = self.fisheye_fov
-        self._fish_prog["u_aspect"].value = self.aspect
-        self.ctx.disable(moderngl.DEPTH_TEST)
-        self._fish_vao.render(moderngl.TRIANGLE_STRIP)
-        self.ctx.enable(moderngl.DEPTH_TEST)
-        return self._read_fbo_rgb(self._fish_fbo)
+    def _remap_gpu(self, K, D, output, viewport) -> None:
+        self._ensure_capture()
+        output.use()
+        self.ctx.viewport = viewport
+        use_kb = self.fisheye_mode in ("opencv", "cv2", "kannala", "kb") and K is not None and D is not None
+        if use_kb:
+            key = (self.pinhole_fov_y_deg, self.capture_width, self.capture_height,
+                   np.asarray(K, dtype=np.float64).tobytes(),
+                   np.asarray(D, dtype=np.float64).tobytes())
+            lut = self._kb_maps.get(key)
+            if lut is None:
+                mx, my = build_fisheye_from_pinhole_maps(
+                    self.width, self.height, K, D, self.pinhole_fov_y_deg,
+                    self.capture_width, self.capture_height)
+                lut = self.ctx.texture((self.width, self.height), 2,
+                    np.stack((mx, my), axis=-1).tobytes(), dtype="f4")
+                self._kb_maps[key] = lut
+            lut.use(location=1)
+            self._kb_prog["u_tex"].value = 0
+            self._kb_prog["u_map"].value = 1
+            vao = self._kb_vao
+        else:
+            self._fish_prog["u_tex"].value = 0
+            self._fish_prog["u_pinhole_fov_y"].value = math.radians(self.pinhole_fov_y_deg)
+            self._fish_prog["u_fisheye_fov"].value = self.fisheye_fov
+            self._fish_prog["u_aspect"].value = self.aspect
+            vao = self._fish_vao
+        self._capture_tex.use(location=0)
+        # Scene faces are CW; the fullscreen quad is CCW.
+        self.ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+        vao.render(moderngl.TRIANGLE_STRIP)
+        self.ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+
+    def _render_camera_to_fbo(self, eye, target, up, K, D, output, viewport) -> None:
+        if self._released:
+            raise RuntimeError("ModernGLFisheyeBackend already released")
+        self._ensure_capture()
+        self._draw_scene(self._proj_fisheye_pinhole, look_at_view(eye, target, up), eye, self._capture_fbo)
+        self._remap_gpu(K, D, output, viewport)
 
     def render_camera(
         self,
@@ -307,23 +391,23 @@ class ModernGLFisheyeBackend:
         When fisheye_mode is 'opencv' (default) and K,D are provided, uses the
         OpenCV Kannala–Brandt model from config as ground-truth intrinsics.
         """
+        self._render_camera_to_fbo(eye, target, up, K, D, self._fish_fbo,
+                                   (0, 0, self.width, self.height))
+        return self._read_fbo_rgb(self._fish_fbo)
+
+    def render_grid(self, cameras) -> np.ndarray:
+        """Render four (eye, target, up, K, D) views into a 2x2 atlas; read once."""
         if self._released:
             raise RuntimeError("ModernGLFisheyeBackend already released")
-
-        use_opencv = self.fisheye_mode in ("opencv", "cv2", "kannala", "kb")
-        if use_opencv and K is not None and D is not None:
-            pinhole = self._render_wide_pinhole(eye, target, up)
-            return remap_pinhole_to_fisheye(
-                pinhole,
-                K=K,
-                D=D,
-                pinhole_fov_y_deg=self.pinhole_fov_y_deg,
-                out_size=(self.width, self.height),
-            )
-
-        # Legacy equidistant GPU path (Phase 0/1)
-        self._render_wide_pinhole(eye, target, up)
-        return self._remap_equidistant_gpu()
+        if len(cameras) != 4:
+            raise ValueError("camera grid requires exactly four views")
+        if self._grid_fbo is None:
+            texture = self.ctx.texture((self.width*2, self.height*2), 3)
+            self._grid_fbo = self.ctx.framebuffer(color_attachments=[texture])
+        for i, (eye, target, up, K, D) in enumerate(cameras):
+            viewport = ((i%2)*self.width, (1-i//2)*self.height, self.width, self.height)
+            self._render_camera_to_fbo(eye, target, up, K, D, self._grid_fbo, viewport)
+        return self._read_fbo_rgb(self._grid_fbo)
 
     def render_pinhole(
         self,

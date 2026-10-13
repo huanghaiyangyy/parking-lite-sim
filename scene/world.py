@@ -78,6 +78,10 @@ class World:
         """Render surround fisheyes → dict[str, HxWx3 uint8]."""
         return self.rig.render_cameras(self.ego_xyz_yaw())
 
+    def render_camera_grid(self) -> np.ndarray:
+        """Render front|left / right|rear directly on GPU for video input."""
+        return self.rig.render_grid(self.ego_xyz_yaw())
+
     def render_god_view(
         self,
         eye_flu: Optional[Sequence[float]] = None,

@@ -14,6 +14,7 @@ import os
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -25,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scene.world import World
+from stream_h264_adb import SEND_STATUS, _read_exact
 
 
 def _save(path: Path, arr: np.ndarray) -> None:
@@ -208,9 +210,15 @@ class _GodViewProxy:
     sizes on one GL context make the readback shear into stripes.
     """
 
-    def __init__(self, config: Path):
+    def __init__(self, config: Path, stream=None, capture_scale=1):
+        self.streaming = stream is not None
+        self.stream_stats = (0, 0.0, 0.0)
         self.god = self._open("god", config)
-        self.cams = self._open("cams", config)
+        extra = ["--capture-scale", str(capture_scale)]
+        if stream:
+            extra += ["--stream-adb", "--serial", stream.serial, "--fps", str(stream.fps),
+                      "--bitrate", stream.bitrate]
+        self.cams = self._open("cams", config, extra)
         ready = self.cams.stdout.readline()
         parts = ready.decode(errors="replace").split()
         if not parts or parts[0] != "ready":
@@ -221,12 +229,12 @@ class _GodViewProxy:
             raise RuntimeError("god worker failed to start: %r" % got)
 
     @staticmethod
-    def _open(mode: str, config: Path) -> subprocess.Popen:
+    def _open(mode: str, config: Path, extra=()) -> subprocess.Popen:
         env = os.environ.copy()
         env.pop("DISPLAY", None)
         env.pop("WAYLAND_DISPLAY", None)
         proc = subprocess.Popen(
-            [sys.executable, str(ROOT / "scripts" / "view_render_worker.py")],
+            [sys.executable, str(ROOT / "scripts" / "view_render_worker.py"), *extra],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
@@ -285,7 +293,10 @@ class _GodViewProxy:
     def render_cameras(self, ego) -> dict:
         vals = [float(ego["x"]), float(ego["y"]), float(ego["z"]), float(ego["yaw"])]
         self._send(self.cams, " ".join("%.6f" % v for v in vals) + "\n")
-        return {name: self._read_frame(self.cams) for name in self.cam_names}
+        images = {name: self._read_frame(self.cams) for name in self.cam_names}
+        if self.streaming:
+            self.stream_stats = SEND_STATUS.unpack(_read_exact(self.cams.stdout, SEND_STATUS.size))[:3]
+        return images
 
     def close(self) -> None:
         for proc in (self.god, self.cams):
@@ -301,7 +312,7 @@ class _GodViewProxy:
                 proc.kill()
 
 
-def try_interactive(world: World, size=(1280, 800)) -> int:
+def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=1) -> int:
     """Draggable orbit window. LMB orbit, RMB pan, wheel zoom."""
     try:
         import pygame
@@ -358,7 +369,7 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
     print("  window %dx%d on DISPLAY=%s" % (win_w, win_h, os.environ.get("DISPLAY")))
     print("  arrows = drive, LMB orbit, RMB pan, wheel zoom, F follow, R reset, C cameras")
     try:
-        renderer = _GodViewProxy(Path(world.config_path))
+        renderer = _GodViewProxy(Path(world.config_path), stream, capture_scale)
     except Exception as exc:
         print("  live window skipped:", exc)
         pygame.quit()
@@ -386,8 +397,9 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
         pygame.surfarray.blit_array(surf, np.transpose(arr, (1, 0, 2)))
         return surf
 
-    def render_cam_strip() -> pygame.Surface:
-        images = renderer.render_cameras(world.ego_pose)
+    def render_cam_strip(images=None) -> pygame.Surface:
+        if images is None:
+            images = renderer.render_cameras(world.ego_pose)
         names = list(renderer.cam_names)
         cell_w = god_w // max(1, len(names))
         strip = pygame.Surface((god_w, cam_strip_h))
@@ -408,7 +420,9 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
         return strip
 
     img = render_frame()
+    surf = rgb_surface(img, (god_w, god_h))
     cam_strip = render_cam_strip() if show_cams else None
+    next_camera = time.monotonic() + (1/stream.fps if stream else 0)
     running = True
     while running:
         dt = clock.get_time() / 1000.0
@@ -525,13 +539,21 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
         if moving:
             dirty = True
 
-        if dirty:
+        # Board mode refreshes the overview at the camera cadence, leaving
+        # the UI loop free to collect driving input between video frames.
+        if dirty and (not stream or time.monotonic() >= next_camera):
             img = render_frame()
-            if show_cams:
+            surf = rgb_surface(img, (god_w, god_h))
+            if show_cams and not stream:
                 cam_strip = render_cam_strip()
             dirty = False
 
-        surf = rgb_surface(img, (god_w, god_h))
+        if stream and time.monotonic() >= next_camera:
+            images = renderer.render_cameras(world.ego_pose)
+            if show_cams:
+                cam_strip = render_cam_strip(images)
+            next_camera = max(next_camera + 1/stream.fps, time.monotonic())
+
         screen.fill((8, 8, 10))
         screen.blit(surf, (0, 0))
         if show_cams and cam_strip is not None:
@@ -550,6 +572,10 @@ def try_interactive(world: World, size=(1280, 800)) -> int:
                 clock.get_fps(),
             ),
         ]
+        if stream:
+            sent, send_fps, send_mbps = renderer.stream_stats
+            hud.append(f"Board SEND {send_fps:.2f} fps  {send_mbps:.2f} Mbps  frames={sent}"
+                       f"  target={stream.fps} fps/{stream.bitrate}  capture={capture_scale}x")
         y = 8
         for line in hud:
             text = font.render(line, True, (255, 230, 80), (0, 0, 0))
@@ -570,12 +596,23 @@ def main(argv=None) -> int:
     parser.add_argument("--out", type=Path, default=ROOT / "output" / "j01_view")
     parser.add_argument("--frames", type=int, default=8)
     parser.add_argument("--interactive", action="store_true", help="Open orbit window after stills")
+    parser.add_argument("--stream-adb", action="store_true", help="send the window's four camera frames to the board")
+    parser.add_argument("--serial", default="")
+    parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--bitrate", default="12M", help="total four-camera H264 bitrate")
+    parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=1,
+                        help="internal pinhole sampling scale; output stays 1280x960 per camera")
     parser.add_argument(
         "--window",
         action="store_true",
         help="Open a draggable orbit window only (skip PNG/GIF stills)",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if not 1 <= args.fps <= 30:
+        parser.error("fps must be 1..30")
+    if args.stream_adb and not (args.window or args.interactive):
+        parser.error("--stream-adb requires --window or --interactive")
+    stream = args if args.stream_adb else None
 
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -594,7 +631,7 @@ def main(argv=None) -> int:
     print("  vehicle:", {k: ego.get(k) for k in ("length_m", "width_m", "origin")})
 
     if args.window:
-        rc = try_interactive(world)
+        rc = try_interactive(world, stream=stream, capture_scale=args.capture_scale)
         return rc
 
     backend = world.rig.ensure_backend()
@@ -643,7 +680,7 @@ def main(argv=None) -> int:
     _save(out_dir / "bev.png", bev)
 
     if args.interactive:
-        try_interactive(world)
+        try_interactive(world, stream=stream, capture_scale=args.capture_scale)
 
     world.release()
     print("view_scene OK —", out_dir)

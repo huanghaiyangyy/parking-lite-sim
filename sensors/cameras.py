@@ -142,6 +142,7 @@ class CameraRig:
                 fisheye_mode=str(self.render_cfg.get("fisheye_mode", "opencv")),
                 near=float(self.render_cfg.get("near", 0.05)),
                 far=float(self.render_cfg.get("far", 80.0)),
+                pinhole_capture_scale=int(self.render_cfg.get("pinhole_capture_scale", 1)),
             )
             # Apply last known ego pose so mesh is never stuck at stale origin
             x, y, z, yaw = self._ego_xyz_yaw
@@ -212,6 +213,19 @@ class CameraRig:
                 D=cam.D,
             )
         return out
+
+    def render_grid(
+        self, ego_xyz_yaw: Tuple[float, float, float, float],
+    ) -> np.ndarray:
+        """AIS 2x2 layout: front|left / right|rear, with one GPU readback."""
+        self.sync_ego_pose(ego_xyz_yaw)
+        backend = self.ensure_backend()
+        views = []
+        for name in ("front", "left", "right", "rear"):
+            cam = self.cameras[name]
+            look = self.camera_look_gl(name, ego_xyz_yaw)
+            views.append((look["eye"], look["target"], look["up"], cam.K, cam.D))
+        return backend.render_grid(views)
 
     def render_god_view(
         self,
