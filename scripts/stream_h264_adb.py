@@ -191,8 +191,8 @@ def main(argv=None):
     p.add_argument("--fps", type=int, default=10)
     p.add_argument("--bitrate", default="12M", help="total four-camera bitrate")
     p.add_argument("--scale", type=float, choices=(1.0, 0.5), default=1.0)
-    p.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=1,
-                   help="internal sampling scale; does not change camera output size")
+    p.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=4,
+                   help="internal sampling scale (default: %(default)s); does not change camera output size")
     p.add_argument("--seconds", type=float, default=0.0)
     p.add_argument("--loop-motion", action="store_true",
                    help="move back and forth inside the lot for continuous viewing")

@@ -185,7 +185,7 @@ class ModernGLFisheyeBackend:
         fisheye_mode: str = "opencv",
         near: float = 0.05,
         far: float = 80.0,
-        pinhole_capture_scale: int = 1,
+        pinhole_capture_scale: int = 4,
     ):
         self.width = int(width)
         self.height = int(height)

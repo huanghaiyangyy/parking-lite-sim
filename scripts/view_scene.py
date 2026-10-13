@@ -210,7 +210,7 @@ class _GodViewProxy:
     sizes on one GL context make the readback shear into stripes.
     """
 
-    def __init__(self, config: Path, stream=None, capture_scale=1):
+    def __init__(self, config: Path, stream=None, capture_scale=4):
         self.streaming = stream is not None
         self.stream_stats = (0, 0.0, 0.0)
         self.god = self._open("god", config)
@@ -312,7 +312,7 @@ class _GodViewProxy:
                 proc.kill()
 
 
-def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=1) -> int:
+def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4) -> int:
     """Draggable orbit window. LMB orbit, RMB pan, wheel zoom."""
     try:
         import pygame
@@ -600,8 +600,8 @@ def main(argv=None) -> int:
     parser.add_argument("--serial", default="")
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--bitrate", default="12M", help="total four-camera H264 bitrate")
-    parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=1,
-                        help="internal pinhole sampling scale; output stays 1280x960 per camera")
+    parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=4,
+                        help="internal pinhole sampling scale (default: %(default)s); output stays 1280x960 per camera")
     parser.add_argument(
         "--window",
         action="store_true",
@@ -621,6 +621,7 @@ def main(argv=None) -> int:
     print("  output:", out_dir)
 
     world = World.from_config(args.config)
+    world.rig.render_cfg["pinhole_capture_scale"] = args.capture_scale
     world.set_ego_pose(0.5, 1.5, 0.0, math.radians(28.0))
     ego = world.rig.vehicle_cfg
     print(

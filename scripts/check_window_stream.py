@@ -22,7 +22,7 @@ from view_scene import _GodViewProxy
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=4)
     args = parser.parse_args()
     config = ROOT / "configs/j01.yaml"
     chunks, previews, captures = [], [], []

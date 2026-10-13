@@ -142,7 +142,7 @@ class CameraRig:
                 fisheye_mode=str(self.render_cfg.get("fisheye_mode", "opencv")),
                 near=float(self.render_cfg.get("near", 0.05)),
                 far=float(self.render_cfg.get("far", 80.0)),
-                pinhole_capture_scale=int(self.render_cfg.get("pinhole_capture_scale", 1)),
+                pinhole_capture_scale=int(self.render_cfg.get("pinhole_capture_scale", 4)),
             )
             # Apply last known ego pose so mesh is never stuck at stale origin
             x, y, z, yaw = self._ego_xyz_yaw

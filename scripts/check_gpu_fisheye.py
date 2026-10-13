@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--config", type=Path, default=ROOT / "configs/j01.yaml")
     parser.add_argument("--scale", type=float, choices=(1.0, 0.5), default=1.0)
     parser.add_argument("--frames", type=int, default=60)
-    parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     if args.frames < 2:
