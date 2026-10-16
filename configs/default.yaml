@@ -1,0 +1,112 @@
+# Parking-lite Phase 5 default config
+# Frame: vehicle FLU — forward-x, left-y, up-z (meters, radians unless noted)
+# Camera K/D are sim ground-truth for OpenCV cv2.fisheye (Kannala–Brandt D=[k1,k2,k3,k4]).
+
+project:
+  name: parking-lite-demo
+  phase: 5
+
+frame:
+  convention: vehicle_FLU
+  description: "x forward, y left, z up"
+
+vehicle:
+  length_m: 4.4
+  width_m: 1.9
+  height_m: 1.5
+  # Ego pose defaults (world FLU); yaw about up-z
+  ego_pose:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    yaw_deg: 0.0
+
+image:
+  width: 1280
+  height: 960
+  # alternate: 1024x640
+  alternate_width: 1024
+  alternate_height: 640
+
+render:
+  # Phase 2: wide pinhole FBO → OpenCV fisheye LUT (K/D) → cv2.remap
+  # fisheye_mode: opencv | equidistant (legacy GPU shader)
+  fisheye_mode: opencv
+  # Single pinhole approx; tan(fov/2) blows up near 180° — use ~165–170°.
+  # Rays with θ≥90° or outside this frustum sample black (see README).
+  pinhole_fov_y_deg: 165.0
+  fisheye_fov_deg: 190.0   # legacy equidistant path only
+  near: 0.05
+  far: 80.0
+  # Demo GL scene uses Y-up / +Z forward; backend converts FLU↔GL
+
+god_view:
+  # World-fixed pinhole orbit / overview (FLU meters). Not fisheye.
+  eye_flu: [18.0, -22.0, 28.0]
+  target_flu: [0.0, 0.0, 0.0]
+  up_flu: [0.0, 0.0, 1.0]
+  fov_y_deg: 55.0
+
+cameras:
+  # Intrinsics sized for 1280x960; fx/fy chosen for ~170–190° KB coverage.
+  # Extrinsics: translation (m) + rotation_deg [roll, pitch, yaw] in vehicle FLU
+  # (intrinsic XYZ: roll about x, pitch about y, yaw about z). Pitch toward ground.
+  # D = [k1,k2,k3,k4] are sim GT (mild realistic automotive fisheye), not zeros.
+  front:
+    name: front
+    translation_m: [2.35, 0.0, 1.05]
+    rotation_deg: [0.0, -28.0, 0.0]   # pitch down toward ground
+    K: [[420.0, 0.0, 640.0],
+        [0.0, 420.0, 480.0],
+        [0.0, 0.0, 1.0]]
+    D: [-0.045, 0.018, -0.006, 0.001]  # sim GT — OpenCV fisheye
+
+  rear:
+    name: rear
+    translation_m: [-2.35, 0.0, 1.05]
+    rotation_deg: [0.0, -28.0, 180.0]  # face aft, pitch down
+    K: [[420.0, 0.0, 640.0],
+        [0.0, 420.0, 480.0],
+        [0.0, 0.0, 1.0]]
+    D: [-0.045, 0.018, -0.006, 0.001]
+
+  left:
+    name: left
+    translation_m: [0.20, 1.10, 1.15]
+    rotation_deg: [0.0, -35.0, 90.0]   # face +y (left), pitch down
+    K: [[400.0, 0.0, 640.0],
+        [0.0, 400.0, 480.0],
+        [0.0, 0.0, 1.0]]
+    D: [-0.050, 0.020, -0.007, 0.001]
+
+  right:
+    name: right
+    translation_m: [0.20, -1.10, 1.15]
+    rotation_deg: [0.0, -35.0, -90.0]  # face -y (right), pitch down
+    K: [[400.0, 0.0, 640.0],
+        [0.0, 400.0, 480.0],
+        [0.0, 0.0, 1.0]]
+    D: [-0.050, 0.020, -0.007, 0.001]
+
+bev:
+  # Bird's-eye extents in vehicle FLU (meters) and resolution
+  forward_m: 8.0
+  back_m: 8.0
+  left_m: 6.0
+  right_m: 6.0
+  resolution_m_per_px: 0.02
+  # Derived: width_px ≈ (left+right)/res = 600, height_px ≈ (fwd+back)/res = 800
+
+scene:
+  # Phase 1: procedural lot + dynamic ego (assets/ ready for glTF/OBJ swap-in)
+  type: procedural_lot
+  placeholder: false
+  assets_root: assets
+
+frames:
+  count: 1
+  dt_s: 0.033
+
+# Kinematic vehicle control (Phase vehicle-control) lives in a separate file
+# for clear external encapsulation — loaded by vehicle.VehicleController, not World.
+vehicle_config: configs/vehicle.yaml

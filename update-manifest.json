@@ -1,0 +1,28 @@
+{
+  "paseo_session": "111d26b7-aad1-4512-8208-4f14cf21abc6",
+  "worktree": "/home/huang/.paseo/worktrees/09zuulsa/tx2-h264-port",
+  "target": "huang@192.168.8.107:/home/huang/tx2-sim",
+  "remote_synced": true,
+  "remote_blocker": null,
+  "board_e2e_verified": false,
+  "files": {
+    "scripts/apa_can_bridge.py": "9352c12e0a1bd229d85f368e8fa3bd7efef9cd2f536c453dd2579a3ee24700ac",
+    "scripts/view_scene.py": "64a73b4790953f3384478dc5246cc0c52841a52392e8d0a1fc283c7499980a14",
+    "README.md": "7ad379ff44057fa1a6ad8b08dc607d5287aa514919e1d158613b25e18c4acdc0",
+    "vehicle/config.py": "2e5ac56f0f6c221aed9e85a993683057d2746cf9974f4eaff5a7e67359e14e52",
+    "vehicle/kinematics.py": "7b9cc542873360088e012a468406bb2aa2189a2f41a6ccf5767576b2af2f8978",
+    "configs/j01_vehicle.yaml": "e219cda5eb10b4d431626e009a1872eacd2e58ee2197fb768f6c6fcb9a7b6249"
+  },
+  "dependency_files": {
+    "vehicle/__init__.py": "ee41ffe69a99c54892b068e7a75647feffdbf39f92ebda49f4516639e6f98259",
+    "vehicle/config.py": "2e5ac56f0f6c221aed9e85a993683057d2746cf9974f4eaff5a7e67359e14e52",
+    "vehicle/interface.py": "60e7f82ef0870e6504727f18d8e1ba803c5af4c2b5ef40f18d356483b3a554c0",
+    "vehicle/kinematics.py": "7b9cc542873360088e012a468406bb2aa2189a2f41a6ccf5767576b2af2f8978",
+    "configs/j01_vehicle.yaml": "e219cda5eb10b4d431626e009a1872eacd2e58ee2197fb768f6c6fcb9a7b6249",
+    "scripts/view_render_worker.py": "335f143af925b8b19fa60f2a985f1980fadb7cda3128b076947fe9ee134d84cf",
+    "scripts/stream_h264_adb.py": "9932bd77e962d33e6f75e2984407e290fc9fead6febe991d867a9e18245f3d38"
+  },
+  "deployment_date": "2026-10-14",
+  "remote_backup": "/home/huang/tx2-sim-backup-can-20261014-084510",
+  "remote_offline_checks_passed": true
+}

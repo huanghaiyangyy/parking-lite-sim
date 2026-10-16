@@ -1,0 +1,36 @@
+# Material library for round_parking_lot
+newmtl Asphalt1_Road
+Kd 0.250 0.260 0.280
+Ka 0.2 0.2 0.2
+Ks 0.1 0.1 0.1
+
+newmtl LaneMarking1_Marking
+Kd 0.950 0.950 0.950
+Ka 0.2 0.2 0.2
+Ks 0.1 0.1 0.1
+
+newmtl LaneMarkingYellow1_Marking
+Kd 0.950 0.850 0.150
+Ka 0.2 0.2 0.2
+Ks 0.1 0.1 0.1
+
+newmtl Concrete1_Curb
+Kd 0.600 0.600 0.620
+Ka 0.2 0.2 0.2
+Ks 0.1 0.1 0.1
+
+newmtl Concrete1_Gutter
+Kd 0.450 0.450 0.470
+Ka 0.2 0.2 0.2
+Ks 0.1 0.1 0.1
+
+newmtl Concrete1_Sidewalk
+Kd 0.650 0.650 0.680
+Ka 0.2 0.2 0.2
+Ks 0.1 0.1 0.1
+
+newmtl Grass1_Ground
+Kd 0.280 0.450 0.250
+Ka 0.2 0.2 0.2
+Ks 0.1 0.1 0.1
+

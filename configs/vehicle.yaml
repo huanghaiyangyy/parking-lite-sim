@@ -1,0 +1,19 @@
+# Vehicle kinematic control + state feedback (external, not hardcoded).
+# Units: meters, seconds, degrees for angles in config; radians internally where noted.
+# Frame: vehicle / world FLU — +x forward, +y left, +z up.
+
+vehicle:
+  wheelbase_m: 2.7
+  track_width_m: 1.55
+  steering_ratio: 16.0          # steer_wheel_deg / road_wheel_deg
+  max_steer_wheel_deg: 500
+  max_road_wheel_deg: 35
+  max_accel_mps2: 2.0
+  max_decel_mps2: 4.0
+  max_speed_mps: 5.0            # parking-ish
+  wheel_radius_m: 0.33
+  pulse_ticks_per_wheel_rev: 96 # configurable ABS-like ticks
+  gear_map: {D: 1, R: -1, N: 0, P: 0}
+
+control:
+  dt_s: 0.02

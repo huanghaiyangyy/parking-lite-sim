@@ -1,0 +1,30 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Generated outputs (phase demos write here)
+output/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Keep assets directory structure in git
+!assets/.gitkeep
+
+# Local J01 mesh from libavm.so (do not publish the extract)
+assets/vehicle/J01.obj
+assets/vehicle/J01.mtl
+assets/vehicle/parts.json
+assets/vehicle/tex
