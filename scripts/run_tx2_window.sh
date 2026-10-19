@@ -18,5 +18,5 @@ if [ -z "$serial" ]; then
 fi
 echo "ADB device: $serial"
 exec "$sim_python" -u scripts/view_window.py \
-  --can can0 --stream-adb --serial "$serial" \
+  --can can0 --stream-adb --odom-adb --serial "$serial" \
   --encoder jetson --fps 10 --bitrate 12M --capture-scale 4 "$@"

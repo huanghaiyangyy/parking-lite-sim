@@ -12,7 +12,7 @@ import moderngl
 import numpy as np
 
 from scene.ego_vehicle import build_ego_mesh
-from scene.lot import build_static_lot
+from scene.lot import build_static_lot, surface_material_ids
 from sensors.fisheye_opencv import build_fisheye_from_pinhole_maps
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,16 +23,19 @@ SCENE_VS = """
 in vec3 in_position;
 in vec3 in_normal;
 in vec3 in_color;
+in float in_material;
 uniform mat4 u_mvp;
 uniform mat4 u_model;
 out vec3 v_normal;
 out vec3 v_color;
 out vec3 v_world;
+flat out int v_material;
 void main() {
     vec4 world = u_model * vec4(in_position, 1.0);
     v_world = world.xyz;
     v_normal = mat3(u_model) * in_normal;
     v_color = in_color;
+    v_material = int(in_material);
     gl_Position = u_mvp * vec4(in_position, 1.0);
 }
 """
@@ -42,20 +45,113 @@ SCENE_FS = """
 in vec3 v_normal;
 in vec3 v_color;
 in vec3 v_world;
+flat in int v_material;
 uniform vec3 u_light_dir;
 uniform vec3 u_cam_pos;
+uniform bool u_realistic;
+uniform bool u_shadowed;
+uniform bool u_use_capture_mask;
+uniform sampler2D u_capture_mask;
+uniform sampler2D u_surface_noise;
+uniform sampler2DShadow u_shadow;
+uniform mat4 u_light_vp;
 out vec4 f_color;
+
+// World-space metres keep the pattern fixed as cameras/ego move; mipmaps
+// filter the texture and derivatives filter joints at grazing fisheye angles.
+vec3 surface_color(vec3 n) {
+    if (v_material == 0)
+        return v_color;
+    vec2 uv = abs(n.y) > 0.65 ? v_world.xz
+        : vec2(abs(n.x) > abs(n.z) ? v_world.z : v_world.x, v_world.y);
+    float grain = texture(u_surface_noise, uv * 2.0).r - 0.5;
+    float mottling = texture(u_surface_noise, uv * 0.047).g - 0.5;
+    if (v_material == 2) {
+        vec3 color = vec3(0.70, 0.685, 0.65) * (1.0 + 0.06*grain + 0.18*mottling);
+        if (abs(n.y) < 0.65) {
+            // Cast concrete panels: 2.4 m wide, 1.2 m high, 12 mm joints.
+            vec2 spacing = vec2(2.4, 1.2);
+            vec2 edge = min(mod(uv, spacing), spacing - mod(uv, spacing));
+            vec2 joint = 1.0 - smoothstep(vec2(0.006),
+                vec2(0.006) + max(fwidth(uv), vec2(0.001)), edge);
+            color *= 1.0 - 0.18 * max(joint.x, joint.y);
+            float damp = 1.0 - smoothstep(0.05, 0.48 + 0.25*mottling, v_world.y);
+            color *= 1.0 - 0.22*damp;
+        }
+        return color;
+    }
+    if (v_material == 1)
+        return vec3(0.225, 0.235, 0.245) * (1.0 + 0.22*grain + 0.14*mottling);
+    if (v_material == 3)
+        return v_color * (1.0 + 0.09*grain + 0.12*mottling);
+    if (v_material == 5) {
+        // Light concrete top, darker vertical face and grime at road contact.
+        // Existing geometry already supplies the 16.5 cm riser and bevel.
+        vec3 color = vec3(0.69, 0.68, 0.64) * (0.90 + 0.10*abs(n.y));
+        float along = abs(n.x) > abs(n.z) ? v_world.z : v_world.x;
+        float seam = abs(fract(along) - 0.5);
+        float joint = 1.0 - smoothstep(0.004, 0.004 + max(fwidth(along), 0.001), seam);
+        color *= 1.0 - 0.15*joint;
+        return color * (1.0 + 0.10*grain + 0.10*mottling);
+    }
+    if (v_material == 6)
+        return v_color * (0.97 + 0.05*grain + 0.05*mottling);
+    if (v_material == 7)
+        return v_color * (0.98 + 0.03*grain);
+    if (v_material == 4)
+        return v_color * (0.94 + 0.06*grain + 0.05*mottling);
+    return v_color;
+}
+
+float visibility(vec3 n) {
+    vec4 p = u_light_vp * vec4(v_world, 1.0);
+    vec3 q = p.xyz / p.w * 0.5 + 0.5;
+    if (any(lessThan(q, vec3(0.0))) || any(greaterThan(q, vec3(1.0))))
+        return 1.0;
+    float bias = max(0.00015, 0.0006 * (1.0 - max(dot(n, normalize(-u_light_dir)), 0.0)));
+    vec2 step = 0.75 / vec2(textureSize(u_shadow, 0));
+    return 0.25 * (
+        texture(u_shadow, vec3(q.xy + vec2(-step.x, -step.y), q.z - bias)) +
+        texture(u_shadow, vec3(q.xy + vec2( step.x, -step.y), q.z - bias)) +
+        texture(u_shadow, vec3(q.xy + vec2(-step.x,  step.y), q.z - bias)) +
+        texture(u_shadow, vec3(q.xy + vec2( step.x,  step.y), q.z - bias)));
+}
+
 void main() {
+    if (u_use_capture_mask && texelFetch(u_capture_mask, ivec2(gl_FragCoord.xy), 0).r < 0.5)
+        discard;
     vec3 n = normalize(v_normal);
     float ndl = max(dot(n, normalize(-u_light_dir)), 0.0);
-    float ambient = 0.42;
-    float diffuse = 0.78 * ndl;
-    float dist = length(v_world - u_cam_pos);
-    float fog = clamp((dist - 8.0) / 40.0, 0.0, 0.55);
-    vec3 lit = v_color * (ambient + diffuse);
+    float fog = 0.0;
+    vec3 lit;
+    if (u_realistic) {
+        // Simple lighting keeps surface orientation cues without shadow-map,
+        // specular or fog work. The previous lighting remains opt-in.
+        float sky = 0.62 + 0.08*max(n.y, 0.0);
+        float shadow = u_shadowed && ndl > 0.0 ? visibility(n) : 1.0;
+        lit = surface_color(n) * (sky + 0.40*ndl*shadow);
+        if (u_shadowed) {
+            if (v_material == 6 || v_material == 7) {
+                vec3 view_dir = normalize(u_cam_pos - v_world);
+                float sheen = pow(max(dot(reflect(normalize(u_light_dir), n), view_dir), 0.0), 32.0);
+                lit += vec3(v_material == 7 ? 0.16 : 0.06) * sheen * shadow;
+            }
+            fog = clamp((length(v_world - u_cam_pos) - 25.0) / 130.0, 0.0, 0.25);
+        }
+    } else {
+        lit = v_color * (0.42 + 0.78*ndl);
+        fog = clamp((length(v_world - u_cam_pos) - 8.0) / 40.0, 0.0, 0.55);
+    }
     vec3 fog_col = vec3(0.28, 0.30, 0.33);
     f_color = vec4(mix(lit, fog_col, fog), 1.0);
 }
+"""
+
+SHADOW_VS = """
+#version 330 core
+in vec3 in_position;
+uniform mat4 u_mvp;
+void main() { gl_Position = u_mvp * vec4(in_position, 1.0); }
 """
 
 # Legacy Phase 0/1 equidistant remap (kept for fisheye_mode=equidistant)
@@ -157,6 +253,20 @@ void main() {
 }
 """
 
+def capture_sample_mask(mx, my, width, height):
+    """KB source footprint plus complete 2x2 quads for texture derivatives."""
+    valid = (mx >= 0.0) & (my >= 0.0)
+    x = np.rint(mx[valid] * 32.0).astype(np.int32) // 32
+    y = np.rint(my[valid] * 32.0).astype(np.int32) // 32
+    mask = np.zeros((height + height % 2, width + width % 2), dtype=np.uint8)
+    for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        mask[np.clip(y + dy, 0, height - 1), np.clip(x + dx, 0, width - 1)] = 255
+    # A partial quad discarded before fwidth/texture can change mip selection
+    # or joint filtering. Keep all four invocations for every required quad.
+    quads = mask.reshape(mask.shape[0] // 2, 2, mask.shape[1] // 2, 2)
+    quads[:] = quads.max(axis=(1, 3), keepdims=True)
+    return np.ascontiguousarray(mask[:height, :width][::-1])
+
 
 def _mat4_bytes(m: glm.mat4) -> bytes:
     return np.array(m, dtype="f4").T.tobytes()
@@ -201,7 +311,17 @@ class ModernGLFisheyeBackend:
         near: float = 0.05,
         far: float = 80.0,
         pinhole_capture_scale: int = 4,
+        material_style: str = "realistic",
+        pinhole_sample_mask: bool = True,
+        lighting_style: str = "simple",
     ):
+        if material_style not in ("flat", "realistic"):
+            raise ValueError("material_style must be 'flat' or 'realistic'")
+        self.material_style = material_style
+        if lighting_style not in ("simple", "shadowed"):
+            raise ValueError("lighting_style must be 'simple' or 'shadowed'")
+        self.lighting_style = lighting_style
+        self.pinhole_sample_mask = bool(pinhole_sample_mask)
         self.width = int(width)
         self.height = int(height)
         if pinhole_capture_scale not in (1, 2, 4):
@@ -241,7 +361,7 @@ class ModernGLFisheyeBackend:
 
         self._prog = self.ctx.program(vertex_shader=SCENE_VS, fragment_shader=SCENE_FS)
 
-        lot_data = build_static_lot(self.assets_root)
+        lot_data = build_static_lot(self.assets_root).reshape(-1, 9)
         ego_data = build_ego_mesh(
             length_m,
             width_m,
@@ -249,18 +369,36 @@ class ModernGLFisheyeBackend:
             self.assets_root,
             origin_forward_offset_m=origin_fwd,
             wheelbase_m=wheelbase_m,
-        )
+        ).reshape(-1, 9)
 
-        self._lot_vbo = self.ctx.buffer(lot_data.tobytes())
+        # Keep the on-disk Nx9 cache unchanged; material IDs are GPU-only.
+        lot_gpu = np.column_stack((lot_data, surface_material_ids(lot_data)))
+        ego_gpu = np.column_stack((ego_data, np.zeros(len(ego_data), dtype=np.float32)))
+        self._lot_vbo = self.ctx.buffer(lot_gpu.tobytes())
         self._lot_vao = self.ctx.vertex_array(
             self._prog,
-            [(self._lot_vbo, "3f 3f 3f", "in_position", "in_normal", "in_color")],
+            [(self._lot_vbo, "3f 3f 3f 1f", "in_position", "in_normal", "in_color", "in_material")],
         )
-        self._ego_vbo = self.ctx.buffer(ego_data.tobytes())
+        self._ego_vbo = self.ctx.buffer(ego_gpu.tobytes())
         self._ego_vao = self.ctx.vertex_array(
             self._prog,
-            [(self._ego_vbo, "3f 3f 3f", "in_position", "in_normal", "in_color")],
+            [(self._ego_vbo, "3f 3f 3f 1f", "in_position", "in_normal", "in_color", "in_material")],
         )
+
+        noise = np.random.default_rng(20261019).integers(0, 256, (256, 256, 3), dtype=np.uint8)
+        self._surface_noise = self.ctx.texture((256, 256), 3, noise.tobytes())
+        self._surface_noise.build_mipmaps()
+        self._surface_noise.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+        self._shadow_tex = self.ctx.depth_texture((1536, 1536))
+        self._shadow_tex.compare_func = "<="
+        self._shadow_tex.repeat_x = self._shadow_tex.repeat_y = False
+        self._shadow_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._shadow_fbo = self.ctx.framebuffer(depth_attachment=self._shadow_tex)
+        self._shadow_prog = self.ctx.program(vertex_shader=SHADOW_VS,
+                                              fragment_shader="#version 330 core\nvoid main() {}")
+        self._shadow_vaos = [self.ctx.vertex_array(self._shadow_prog,
+            [(vbo, "3f 28x", "in_position")]) for vbo in (self._lot_vbo, self._ego_vbo)]
+        self._shadow_dirty = True
 
         self._color_tex = self.ctx.texture((self.width, self.height), 3)
         depth_rb = self.ctx.depth_renderbuffer((self.width, self.height))
@@ -287,6 +425,7 @@ class ModernGLFisheyeBackend:
             self._kb_prog, [(quad_vbo, "2f 2f", "in_vert", "in_uv")]
         )
         self._kb_maps = {}
+        self._capture_masks = {}
         self._grid_fbo = None
         self._preview_fbo = None
         self._quad_vbo = quad_vbo
@@ -311,7 +450,33 @@ class ModernGLFisheyeBackend:
 
     def set_ego_pose(self, x: float, y: float, z: float, yaw_rad: float) -> None:
         """Update dynamic ego model matrix from world-FLU pose."""
-        self._ego_model = flu_ego_model(x, y, z, yaw_rad)
+        model = flu_ego_model(x, y, z, yaw_rad)
+        if model != self._ego_model:
+            self._shadow_dirty = True
+        self._ego_model = model
+
+    def _update_shadow(self) -> None:
+        if (not self._shadow_dirty or self.material_style == "flat"
+                or self.lighting_style != "shadowed"):
+            return
+        center = glm.vec3(self._ego_model[3])
+        light = center - glm.normalize(glm.vec3(*self._light_dir)) * 60.0
+        self._light_vp = glm.ortho(-24.0, 24.0, -24.0, 24.0, 0.1, 120.0) * glm.lookAt(
+            light, center, glm.vec3(0.0, 1.0, 0.0))
+        self._shadow_fbo.use()
+        self.ctx.viewport = (0, 0, *self._shadow_fbo.size)
+        self._shadow_fbo.clear(depth=1.0)
+        # The light view has no X reflection, unlike the camera view.
+        self.ctx.front_face = "ccw"
+        self.ctx.polygon_offset = (1.1, 2.0)
+        try:
+            for model, vao in zip((self._lot_model, self._ego_model), self._shadow_vaos):
+                self._shadow_prog["u_mvp"].write(_mat4_bytes(self._light_vp * model))
+                vao.render(moderngl.TRIANGLES)
+        finally:
+            self.ctx.polygon_offset = (0.0, 0.0)
+            self.ctx.front_face = "cw"
+        self._shadow_dirty = False
 
     def _ensure_capture(self) -> None:
         if self._capture_fbo is None:
@@ -325,13 +490,27 @@ class ModernGLFisheyeBackend:
                 self._capture_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
                 self._capture_tex.repeat_x = self._capture_tex.repeat_y = False
 
-    def _draw_scene(self, proj: glm.mat4, view: glm.mat4, eye: Sequence[float], fbo=None) -> None:
+    def _draw_scene(self, proj: glm.mat4, view: glm.mat4, eye: Sequence[float], fbo=None,
+                    sample_mask=None) -> None:
+        self._update_shadow()
         target = self._fbo if fbo is None else fbo
         target.use()
         self.ctx.viewport = (0, 0, *target.size)
         self.ctx.clear(0.28, 0.30, 0.33, 1.0)
+        self._prog["u_use_capture_mask"].value = sample_mask is not None
+        self._prog["u_capture_mask"].value = 4
+        if sample_mask is not None:
+            sample_mask.use(location=4)
         self._prog["u_light_dir"].value = self._light_dir
         self._prog["u_cam_pos"].value = (float(eye[0]), float(eye[1]), float(eye[2]))
+        self._prog["u_realistic"].value = self.material_style == "realistic"
+        self._prog["u_shadowed"].value = self.lighting_style == "shadowed"
+        self._surface_noise.use(location=2)
+        self._shadow_tex.use(location=3)
+        self._prog["u_surface_noise"].value = 2
+        self._prog["u_shadow"].value = 3
+        if self.material_style == "realistic" and self.lighting_style == "shadowed":
+            self._prog["u_light_vp"].write(_mat4_bytes(self._light_vp))
 
         for model, vao in (
             (self._lot_model, self._lot_vao),
@@ -364,12 +543,8 @@ class ModernGLFisheyeBackend:
         self._draw_scene(self._proj_fisheye_pinhole, view, eye, self._capture_fbo)
         return self._read_fbo_rgb(self._capture_fbo)
 
-    def _remap_gpu(self, K, D, output, viewport) -> None:
-        self._ensure_capture()
-        output.use()
-        self.ctx.viewport = viewport
-        use_kb = self.fisheye_mode in ("opencv", "cv2", "kannala", "kb") and K is not None and D is not None
-        if use_kb:
+    def _kb_lut(self, K, D):
+        if self.fisheye_mode in ("opencv", "cv2", "kannala", "kb") and K is not None and D is not None:
             key = (self.pinhole_fov_y_deg, self.capture_width, self.capture_height,
                    np.asarray(K, dtype=np.float64).tobytes(),
                    np.asarray(D, dtype=np.float64).tobytes())
@@ -381,6 +556,18 @@ class ModernGLFisheyeBackend:
                 lut = self.ctx.texture((self.width, self.height), 2,
                     np.stack((mx, my), axis=-1).tobytes(), dtype="f4")
                 self._kb_maps[key] = lut
+                mask = capture_sample_mask(mx, my, self.capture_width, self.capture_height)
+                self._capture_masks[key] = self.ctx.texture(
+                    (self.capture_width, self.capture_height), 1, mask.tobytes())
+            return lut, self._capture_masks[key]
+        return None, None
+
+    def _remap_gpu(self, K, D, output, viewport) -> None:
+        self._ensure_capture()
+        output.use()
+        self.ctx.viewport = viewport
+        lut, _ = self._kb_lut(K, D)
+        if lut is not None:
             lut.use(location=1)
             self._kb_prog["u_tex"].value = 0
             self._kb_prog["u_map"].value = 1
@@ -401,7 +588,11 @@ class ModernGLFisheyeBackend:
         if self._released:
             raise RuntimeError("ModernGLFisheyeBackend already released")
         self._ensure_capture()
-        self._draw_scene(self._proj_fisheye_pinhole, look_at_view(eye, target, up), eye, self._capture_fbo)
+        _, mask = self._kb_lut(K, D)
+        if not self.pinhole_sample_mask or self.material_style == "flat":
+            mask = None
+        self._draw_scene(self._proj_fisheye_pinhole, look_at_view(eye, target, up), eye,
+                         self._capture_fbo, sample_mask=mask)
         self._remap_gpu(K, D, output, viewport)
 
     def render_camera(

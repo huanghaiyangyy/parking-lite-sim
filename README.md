@@ -96,7 +96,7 @@ python scripts/run_demo.py
 | `configs/default.yaml` | 场景、车辆尺寸、四相机 K/D/外参、BEV 范围、god_view、render |
 | `configs/vehicle.yaml` | 运动学控制参数（轴距、转向比、轮半径、脉冲等） |
 | `configs/j01.yaml` | **本车 J01**：Kannala–Brandt 内参 + VFF 平均外参，后轴原点 |
-| `configs/j01_vehicle.yaml` | J01 运动学（轴距 2.8 m、转向比 15.3、轮半径 0.334 m） |
+| `configs/j01_vehicle.yaml` | J01 运动学（轴距 2.800 m、转向比 15.3、轮半径 0.334 m） |
 
 本车参数入口：
 
@@ -349,9 +349,30 @@ env -u DISPLAY /home/huang/tx2-sim-venv/bin/python scripts/stream_h264_adb.py \
 
 `scripts/apa_can_bridge.py` 已对齐 2026-10-13 TX2→MCU 实板通过的发送版本：17 种报文的 ID、长度、CAN FD/BRS、CRC 表、计数器及信号位编码与 `/home/huang/apa_can_bridge.py` 一致。固定测试值 3.6 km/h、方向盘 +123.4°、D 档对应 MCU `spd_raw=360`、`steer_raw=9034`、`gear=4`；用户两次 `apa -can` 的全部 14 个接收/E2E 状态均为 0。状态编号是 **0 正常、1 超时、2 未接收、3 CRC、4 计数异常**，车速有效位 1、转角有效位 0 均表示有效。该结果证明 CAN→MCU COM 接收，整套视频/算法闭环还需板端联调。
 
-`chassis_from_vehicle()` 把 `VehicleController` 的档位、车速、方向盘、四轮轮速/轮脉冲、车体加速度和横摆角速度填进这些帧。J01 脉冲距离使用 MCU 里程计的 R17 值 `0.02426745556294918` m；转弯时左右轮按轮距分开。方向盘仍除以仿真配置的转向比 15.3，桥接层不重复换算。MCU 控制表的轴距 2.805 m、名义转向比 16.0134 与仿真配置仍有差异。
+`chassis_from_vehicle()` 把 `VehicleController` 的档位、车速、方向盘、四轮轮速/轮脉冲、车体加速度和横摆角速度填进这些帧。J01 保留已有 TX2 测量基线：轴距 2.800 m、转向比 15.3，脉冲距离为 MCU R17 的 `0.02426745556294918` m。左右轮按各自转弯路程累积，后轮速度平均值等于后轴中心速度，MCU 取平均不会使路程加倍。横摆角速度直接来自模型当前状态，单位转换后进入 Airbag_02，不从渲染帧间航向差倒算。轮向按 DBC 发 1 前进、2 后退、3 停止，MCU 再转成内部 0/1/2。
 
-`CanLink.push()` 只发布同一个车辆状态，独立发送线程按各报文的 10/20/40/50/100/1000 ms 周期发送，渲染等待期间继续发送最近状态；发送线程自身延迟时跳过错过的周期，避免集中补发。首次发布立即发送全套基线帧。接收线程只解析标准数据帧 ADAS_07（0x226、8 字节），CRC 通过且 100 ms 内的请求才参与握手和控制；VLC/EPS 为 Active 时覆盖键盘控制，R 档车体加速度翻为沿档位方向的踏板量。应急/停车覆盖后的实际目标也用于底盘回包。退出或初始化失败会关闭 CAN 线程与套接字。
+### 轮速定位复测
+
+窗口使用 `scripts/live_vehicle.py`，在已有 CAN 线程的 10 ms 目标节拍里更新车辆和传感器；渲染只读快照。模型按实际经过的时间、每步最多 10 ms 积分，漏掉的发送周期不会突发补发。ADAS 接管、过期和驾驶员制动每个传感器周期判断。HUD 显示实际 physics dt 和超过 20 ms 的周期数，100 Hz 是目标值。
+
+启动后先保持静止约 2 秒，等 `SIM / ODOM` 比较出现，再开始行驶。`B` 只重设对比零点，需要停车；`R` 重置场景位置但保留当前进程的累计轮脉冲并重建对比零点。窗口重启仍从零计数，启动跳变需等待稳定后取零点；MCU 的模 4095/4096 问题尚未修改。
+
+每次运行独立保存 `output/odom_runs/<日期时间>-<pid>/`：
+
+- `sim_truth.csv`：每次物理步进的本机时间、实际 dt、独立真值、四轮计数、控制来源与超期次数。
+- `can_tx.csv`：实际发送的 Airbag_02、iBRS_04、iBRS_05 时间和完整载荷；`dry_run=1` 表示没有上总线。
+- `odom_rx.csv`：每帧 ODOM 的源时间、本机接收时间和原始 wheel/fused 字段。
+- `odom_compare.csv`：相对误差、数据年龄、物理节拍和 reset_index；`output/odom_compare.csv` 指向最新一轮，旧的普通 CSV 会备份保留。
+
+比较采用 ODOM **本机接收时刻**的历史仿真位姿，消除 UI 阻塞导致的配对错误。MCU 与 TX2 的时钟没有因此同步，传输与板端处理延迟仍包含在误差中；`rx_age_ms` 是接收后的数据年龄。不要把动态瞬间误差直接当成标定误差，停车稳定后再看残差。
+
+不打开 CAN、不启动渲染的回归检查：
+
+```bash
+rtk proxy /home/huang/tx2-sim-venv/bin/python scripts/check_live_vehicle.py
+```
+
+窗口把 `LiveVehicle.tick` 注册到 CAN 线程，按各报文的 10/20/40/50/100/1000 ms 周期发送；渲染等待期间车辆与反馈继续更新。发送线程自身延迟时跳过错过的发送周期，避免集中补发，原有 `CanLink.push()` 调用方式仍兼容。首次发送全套基线帧。接收线程只解析标准数据帧 ADAS_07（0x226、8 字节），CRC 通过且 100 ms 内的请求才参与握手和控制；VLC/EPS 为 Active 时覆盖键盘控制，R 档车体加速度翻为沿档位方向的踏板量。应急/停车覆盖后的实际目标也用于底盘回包。退出或初始化失败会关闭 CAN 线程与套接字。
 
 本地检查不打开 CAN，使用项目 Python 环境：
 

@@ -32,6 +32,7 @@ class KinematicState:
     steer_wheel_deg: float = 0.0
     road_wheel_deg: float = 0.0
     gear: str = "P"
+    yaw_rate_rps: float = 0.0
     wheel_speed_mps: List[float] = field(
         default_factory=lambda: [0.0, 0.0, 0.0, 0.0]
     )
@@ -132,19 +133,19 @@ def bicycle_step(
     delta = math.radians(road_deg)
     L = params.wheelbase_m
     yaw_rate = 0.0 if abs(L) < 1e-9 else vx * math.tan(delta) / L
+    state.yaw_rate_rps = yaw_rate
 
     state.yaw = state.yaw + yaw_rate * dt
     state.yaw = (state.yaw + math.pi) % (2.0 * math.pi) - math.pi
     state.x += vx * math.cos(state.yaw) * dt
     state.y += vx * math.sin(state.yaw) * dt
 
-    # Bicycle speeds plus left/right split from yaw rate and track width.
-    # Positive steer (left) makes the right wheels travel farther.
+    # The average rear speed is the rear-axle speed even while turning.
     cos_d = math.cos(delta)
     if abs(cos_d) < 1e-3:
         cos_d = math.copysign(1e-3, cos_d if cos_d != 0 else 1.0)
-    half_track = 0.5 * params.track_width_m
     v_front = vx / cos_d
+    half_track = 0.5 * params.track_width_m
     speeds = [
         v_front - yaw_rate * half_track,
         v_front + yaw_rate * half_track,
@@ -186,6 +187,7 @@ def reset_state(
     state.steer_wheel_deg = 0.0
     state.road_wheel_deg = 0.0
     state.gear = "P"
+    state.yaw_rate_rps = 0.0
     state.wheel_speed_mps = [0.0, 0.0, 0.0, 0.0]
     state.wheel_pulse_count = [0, 0, 0, 0]
     state.wheel_pulse_rate_hz = [0.0, 0.0, 0.0, 0.0]

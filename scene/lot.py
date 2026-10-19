@@ -16,6 +16,7 @@ from .mesh_prims import (
     ground_plane,
     line_quad,
     parking_slot_lines,
+    traffic_cone_mesh,
 )
 
 # Slot layout constants (GL XZ). Documented so Phase 1 scripts can park in a slot.
@@ -132,6 +133,59 @@ def load_target_vehicle_template(obj_path: Path):
     pos = np.asarray(positions, dtype=np.float32)
     nrm = np.asarray(normals, dtype=np.float32) if normals else np.zeros_like(pos)
     return pos, nrm, tris
+
+
+def surface_material_ids(vertices: np.ndarray) -> np.ndarray:
+    """Recover surface IDs from the existing Nx9 compiled-lot palette.
+
+    0: unchanged (cars, props), 1: asphalt, 2: wall, 3: concrete,
+    4: paint, 5: curb, 6: cone orange, 7: cone reflective tape.
+    """
+    # ponytail: cached RGB identifies materials; add explicit IDs to the cache
+    # format if future assets share colors between unrelated surface types.
+    ids = np.zeros((len(vertices), 1), dtype=np.float32)
+    for material_id, names in (
+        (1, ("asphalt",)),
+        (2, ("wall", "brick")),
+        (3, ("gutter", "sidewalk", "pillar")),
+        (4, ("marking", "yellow")),
+        (5, ("curb",)),
+        (6, ("cone",)),
+    ):
+        for name in names:
+            match = np.all(np.isclose(vertices[:, 6:9], _color_for_lot_material(name),
+                                      rtol=0, atol=1e-5), axis=1)
+            ids[match, 0] = material_id
+    tape = np.all(np.isclose(vertices[:, 6:9], (0.88, 0.89, 0.86),
+                             rtol=0, atol=1e-5), axis=1)
+    ids[tape, 0] = 7
+    return ids
+
+
+def add_slot_cones(vertices: np.ndarray) -> np.ndarray:
+    """Occupy two empty map bays; leave the left central bay available."""
+    import os
+    if os.environ.get("LOT_SLOT_CONES", "1") == "0":
+        return vertices
+    triangles = vertices.reshape(-1, 3, 9)
+    road = triangles[np.all(np.isclose(triangles[:, 0, 6:9],
+                         _color_for_lot_material("asphalt"), atol=1e-5), axis=1), :, :3]
+    cones = []
+    for x, z in ((2.8, 0.55), (2.8, 1.55), (-3.7, 7.85), (-3.7, 8.85)):
+        # Interpolate the actual road surface so bases neither float nor sink
+        # into the elevated road sections in this asset.
+        a, b, c = road[:, 0], road[:, 1], road[:, 2]
+        den = (b[:, 2]-c[:, 2])*(a[:, 0]-c[:, 0]) + (c[:, 0]-b[:, 0])*(a[:, 2]-c[:, 2])
+        valid = np.abs(den) > 1e-9
+        a, b, c, den = a[valid], b[valid], c[valid], den[valid]
+        u = ((b[:, 2]-c[:, 2])*(x-c[:, 0]) + (c[:, 0]-b[:, 0])*(z-c[:, 2]))/den
+        v = ((c[:, 2]-a[:, 2])*(x-c[:, 0]) + (a[:, 0]-c[:, 0])*(z-c[:, 2]))/den
+        inside = (u >= -1e-6) & (v >= -1e-6) & (u+v <= 1+1e-6)
+        heights = (u*a[:, 1] + v*b[:, 1] + (1-u-v)*c[:, 1])[inside]
+        if not len(heights):
+            raise ValueError("No road surface beneath slot cone at %s" % ((x, z),))
+        cones.extend(traffic_cone_mesh(x, z, float(heights.max()) + 0.001))
+    return np.vstack((vertices, np.asarray(cones, dtype=np.float32).reshape(-1, 9)))
 
 
 def spawn_real_target_cars(template_pos, template_nrm, template_tris, car_instances):
@@ -420,9 +474,9 @@ def build_static_lot(assets_root: Optional[Path] = None, preset: Optional[str] =
             lot_obj = p / "lot" / "lot_parking_lot_3.obj"
             compiled = compiled_lot_path(lot_obj)
             if compiled.is_file() and (not lot_obj.is_file() or compiled.stat().st_mtime >= lot_obj.stat().st_mtime):
-                return load_compiled_lot(compiled)
+                return add_slot_cones(load_compiled_lot(compiled))
             if lot_obj.is_file():
-                return load_lot_obj_mesh(lot_obj, preset="parking_lot_3")
+                return add_slot_cones(load_lot_obj_mesh(lot_obj, preset="parking_lot_3"))
 
         if "map_package" in preset_lower:
             lot_obj = p / "lot" / "lot_map_package.obj"

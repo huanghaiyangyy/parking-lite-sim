@@ -17,6 +17,7 @@ Do not start this while sentry_cansend.py owns the overlapping ids
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import socket
@@ -198,12 +199,14 @@ def chassis_from_vehicle(state, prev=None, dt=0.02, command=None):
         direction = DIR_BACKWARD
     else:
         direction = DIR_FORWARD
-    yaw_rate = 0.0
+    model_yaw_rate = getattr(state, "yaw_rate_rps", None)
+    yaw_rate = 0.0 if model_yaw_rate is None else math.degrees(model_yaw_rate)
     long_accel = 0.0
     steer_rate = 0.0
     if prev is not None and dt > 0:
         dyaw = (state.yaw - prev.yaw + math.pi) % (2.0 * math.pi) - math.pi
-        yaw_rate = math.degrees(dyaw / dt)
+        if model_yaw_rate is None:
+            yaw_rate = math.degrees(dyaw / dt)
         long_accel = (state.speed_mps - prev.speed_mps) / dt
         steer_rate = (state.steer_wheel_deg - prev.steer_wheel_deg) / dt
     brake_pressed = bool(getattr(command, "brake_pressed", False)) if command is not None else False
@@ -512,9 +515,8 @@ def encode_due(state, adas, counters, tick_ms=0):
 class CanLink:
     """Chassis TX and ADAS_07 RX sharing the window's vehicle.
 
-    The caller still steps VehicleController. This object packs due frames
-    on its own 10 ms clock and returns Active controls when a fresh ADAS_07
-    is latched. dry_run never opens a socket.
+    A state provider can advance the vehicle on the same 10 ms clock as TX.
+    Legacy push callers publish snapshots. dry_run never opens a socket.
     """
 
     def __init__(self, iface=None, dry_run=True):
@@ -531,6 +533,9 @@ class CanLink:
         self._stop = threading.Event()
         self._rx = None
         self._tx = None
+        self._state_provider = None
+        self._trace = None
+        self._trace_writer = None
         if not self.dry_run:
             self.sock = open_can(iface)
             self._rx = threading.Thread(
@@ -538,10 +543,22 @@ class CanLink:
             )
             self._rx.start()
 
-    def start(self):
+    def enable_trace(self, path):
+        """Record actual sensor-frame send times and bytes before starting TX."""
+        if self._tx is not None:
+            raise RuntimeError("enable CAN trace before starting TX")
+        self._trace = Path(path).open("w", newline="", buffering=65536)
+        self._trace_writer = csv.writer(self._trace)
+        self._trace_writer.writerow(("tx_mono", "tx_wall", "dry_run", "name", "can_id", "payload_hex"))
+
+    def start(self, state_provider=None):
         """Start periodic TX after the caller has supplied its first state."""
         if self._stop.is_set():
             raise RuntimeError("CAN link is closed")
+        if state_provider is not None:
+            if self._tx is not None:
+                raise RuntimeError("install state provider before starting TX")
+            self._state_provider = state_provider
         if self._tx is None:
             self._tx = threading.Thread(target=self._transmit, daemon=True)
             self._tx.start()
@@ -552,12 +569,18 @@ class CanLink:
             while not self._stop.is_set():
                 now = time.monotonic()
                 frames = [frame for frame in FRAMES if now >= deadlines[frame[0]]]
+                if self._state_provider is not None and any(f[0] == "Airbag_02" for f in frames):
+                    vehicle, command, dt = self._state_provider(now)
+                    self.push(vehicle, command, dt=dt)
                 for name, can_id, payload in encode_frames(
                     self.chassis, self.adas, self.counters, frames,
                 ):
                     if self.sock is not None:
                         self.sock.send(can_frame(can_id, payload))
                     self.sent[name] += 1
+                    if self._trace_writer is not None and name in ("Airbag_02", "iBRS_04", "iBRS_05"):
+                        self._trace_writer.writerow(("%.9f" % time.monotonic(), "%.6f" % time.time(),
+                                                     int(self.dry_run), name, hex(can_id), payload.hex()))
                 # Skip missed periods instead of replaying bursts after a stall.
                 finished = time.monotonic()
                 for name, _can_id, _dlc, period_ms, _table in frames:
@@ -565,7 +588,7 @@ class CanLink:
                     skipped = int((finished - deadlines[name]) / period) + 1
                     deadlines[name] += skipped * period
                 self._stop.wait(max(0, min(deadlines.values()) - time.monotonic()))
-        except OSError as exc:
+        except Exception as exc:
             if not self._stop.is_set():
                 self.error = str(exc)
                 self._stop.set()
@@ -573,12 +596,15 @@ class CanLink:
     def close(self):
         self._stop.set()
         if self._tx is not None:
-            self._tx.join(timeout=0.2)
+            self._tx.join(timeout=1.0)
         sock, self.sock = self.sock, None
         if sock is not None:
             sock.close()
         if self._rx is not None:
             self._rx.join(timeout=0.2)
+        if self._trace is not None:
+            self._trace.close()
+            self._trace = self._trace_writer = None
 
     def inject(self, payload):
         """Parse one ADAS_07 the way the socket thread would."""
@@ -592,7 +618,7 @@ class CanLink:
         self.prev = vehicle
         self._prev_t = time.monotonic()
 
-    def push(self, vehicle, command=None):
+    def push(self, vehicle, command=None, dt=None):
         """Publish the video vehicle's latest state; TX runs independently.
 
         A missing CAN peer fills the socket queue and times out. Keep the
@@ -601,10 +627,8 @@ class CanLink:
         if self.error is not None:
             return
         now = time.monotonic()
-        if self._prev_t is None:
-            dt = 0.01
-        else:
-            dt = max(1e-3, now - self._prev_t)
+        if dt is None:
+            dt = 0.01 if self._prev_t is None else max(1e-3, now - self._prev_t)
         self._prev_t = now
         self.chassis.update(**chassis_from_vehicle(vehicle, self.prev, dt, command))
         self.prev = vehicle
@@ -763,7 +787,7 @@ def self_check():
                 assert encoded[name][0] == crc8(encoded[name], counter, table), name
     vehicle, snap, sent = simulate(1.0, 90.0, 1.0, "D")
     assert vehicle.gear == "D" and vehicle.speed_mps > 0.5
-    assert snap["pulses"][3] > snap["pulses"][2]  # right rear farther on a left turn
+    assert snap["pulses"][3] > snap["pulses"][2]  # right rear travels farther on a left turn
     assert snap["steer_deg"] == vehicle.steer_wheel_deg
     assert sent["iBRS_01"] > sent["iBRS_03"] > 0
     # One meter at the MCU R17 pulse distance.

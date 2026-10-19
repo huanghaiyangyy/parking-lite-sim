@@ -62,6 +62,36 @@ def ground_plane(
     return verts
 
 
+def traffic_cone_mesh(cx: float, cz: float, ground_y: float = 0.0) -> List[float]:
+    """70 cm cone with two reflective bands and a 40 cm rubber base."""
+    orange = (0.98, 0.40, 0.05)
+    white = (0.88, 0.89, 0.86)
+    verts = box_mesh(cx, ground_y + 0.0225, cz, 0.40, 0.045, 0.40, (0.055, 0.058, 0.060))
+    # Rings preserve sharp tape boundaries without introducing extra objects.
+    levels = (0.045, 0.25, 0.34, 0.46, 0.55, 0.70)
+    for band, (y0, y1) in enumerate(zip(levels, levels[1:])):
+        color = white if band in (1, 3) else orange
+        r0 = 0.17 - (y0 - 0.045) / 0.655 * 0.145
+        r1 = 0.17 - (y1 - 0.045) / 0.655 * 0.145
+        for i in range(32):
+            angles = (i*math.tau/32, (i+1)*math.tau/32)
+            corners = [(cx+r*math.cos(a), ground_y+y, cz+r*math.sin(a))
+                       for y, r in ((y0, r0), (y1, r1)) for a in angles]
+            normals = [(math.cos(a), 0.145/0.655, math.sin(a)) for a in angles]
+            length = math.sqrt(1+(0.145/0.655)**2)
+            for tri in ((0, 2, 3), (0, 3, 1)):
+                for k in tri:
+                    verts.extend((*corners[k], *(v/length for v in normals[k%2]), *color))
+    # Small flat cap closes the truncated tip.
+    for i in range(32):
+        a, b = i*math.tau/32, (i+1)*math.tau/32
+        for p in ((cx, ground_y+0.70, cz),
+                  (cx+0.025*math.cos(b), ground_y+0.70, cz+0.025*math.sin(b)),
+                  (cx+0.025*math.cos(a), ground_y+0.70, cz+0.025*math.sin(a))):
+            verts.extend((*p, 0.0, 1.0, 0.0, *orange))
+    return verts
+
+
 def line_quad(
     x0: float,
     z0: float,

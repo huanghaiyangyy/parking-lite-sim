@@ -143,6 +143,9 @@ class CameraRig:
                 near=float(self.render_cfg.get("near", 0.05)),
                 far=float(self.render_cfg.get("far", 80.0)),
                 pinhole_capture_scale=int(self.render_cfg.get("pinhole_capture_scale", 4)),
+                material_style=str(self.render_cfg.get("material_style", "realistic")),
+                pinhole_sample_mask=bool(self.render_cfg.get("pinhole_sample_mask", True)),
+                lighting_style=str(self.render_cfg.get("lighting_style", "simple")),
             )
             # Apply last known ego pose so mesh is never stuck at stale origin
             x, y, z, yaw = self._ego_xyz_yaw

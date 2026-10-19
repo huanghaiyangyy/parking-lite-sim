@@ -124,14 +124,13 @@ def stream_cameras(world, args):
                 requested = tuple(float(v) for v in line.split())
                 if len(requested) != 4:
                     raise ValueError("camera command requires x y z yaw")
+                if snapshot is None:
+                    ack = os.environ.get("SIM_ACK_FD")
+                    if ack:
+                        os.write(int(ack), b"pose\n")
                 with condition:
                     pose = requested
                     condition.notify_all()
-                    if snapshot is None:
-                        condition.wait_for(lambda: snapshot is not None or stopped.is_set())
-                        ack = os.environ.get("SIM_ACK_FD")
-                        if ack:
-                            os.write(int(ack), b"pose\n")
                     condition.wait_for(lambda: snapshot is not None or stopped.is_set())
                     if stopped.is_set():
                         break
@@ -148,11 +147,6 @@ def stream_cameras(world, args):
                 condition.notify_all()
 
     io = threading.Thread(target=preview_io, daemon=True)
-    # Render once before the parent asks. Its first overview read blocks the
-    # process that would otherwise send this pose, and an idle stdin then exits.
-    with condition:
-        pose = (0.0, 0.0, 0.0, 0.0)
-        condition.notify_all()
     sys.stdout.buffer.write(("ready %s\n" % " ".join(world.rig.names)).encode())
     sys.stdout.buffer.flush()
     io.start()

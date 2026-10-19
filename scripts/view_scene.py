@@ -9,6 +9,7 @@ orbit window is attempted only when pygame can open a display.
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import os
 import struct
@@ -247,7 +248,7 @@ class _GodViewProxy:
             [sys.executable, str(ROOT / "scripts" / "view_render_worker.py"), *extra],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=open(ROOT / "output" / (mode + "-worker.log"), "ab"),
             env=env,
             pass_fds=pass_fds,
         )
@@ -305,7 +306,7 @@ class _GodViewProxy:
         self._send(self.god, " ".join("%.6f" % v for v in vals) + "\n")
         return self._read_frame(self.god)
 
-    def render_cameras(self, ego, wait_ack=False, read_frames=True) -> dict:
+    def render_cameras(self, ego, wait_ack=False) -> dict:
         vals = [float(ego["x"]), float(ego["y"]), float(ego["z"]), float(ego["yaw"])]
         self._send(self.cams, " ".join("%.6f" % v for v in vals) + "\n")
         if wait_ack:
@@ -314,14 +315,6 @@ class _GodViewProxy:
             ack = self.cams.ack.read(5)
             if ack != b"pose\n":
                 raise RuntimeError("camera worker closed before the first pose: %r" % ack)
-        if not read_frames:
-            return {}
-        images = {name: self._read_frame(self.cams) for name in self.cam_names}
-        if self.streaming:
-            self.stream_stats = SEND_STATUS.unpack(_read_exact(self.cams.stdout, SEND_STATUS.size))[:3]
-        return images
-
-    def read_cameras(self) -> dict:
         images = {name: self._read_frame(self.cams) for name in self.cam_names}
         if self.streaming:
             self.stream_stats = SEND_STATUS.unpack(_read_exact(self.cams.stdout, SEND_STATUS.size))[:3]
@@ -341,7 +334,8 @@ class _GodViewProxy:
                 proc.kill()
 
 
-def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4, can=None) -> int:
+def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4, can=None,
+                    odom=None) -> int:
     """Draggable orbit window. LMB orbit, RMB pan, wheel zoom."""
     try:
         import pygame
@@ -375,16 +369,37 @@ def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4
     except Exception:
         font = pygame.font.Font(None, 18)
 
-    from vehicle import VehicleController
+    from live_vehicle import LiveVehicle
+    from apa_can_bridge import CanLink
 
     rel = world.config.get("vehicle_config") or "configs/vehicle.yaml"
     vcfg_path = Path(rel)
     if not vcfg_path.is_file():
         vcfg_path = ROOT / rel
-    ctrl = VehicleController(vcfg_path)
     ego0 = world.ego_pose
-    ctrl.reset(ego0["x"], ego0["y"], ego0["yaw"], speed=0.0)
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-%d" % os.getpid()
+    run_dir = ROOT / "output" / "odom_runs" / run_id
+    ctrl = LiveVehicle(vcfg_path, ego0, can or CanLink(dry_run=True), run_dir)
     ctrl.apply_to_world(world, z=0.0)
+    odom_origin = None
+    comparison_index = 0
+    comparison_path = run_dir / "odom_compare.csv"
+    comparison_handle = comparison_path.open("w", newline="", buffering=1)
+    comparison_fields = ("stamp", "sim_dx", "sim_dy", "sim_dyaw", "odom_dx", "odom_dy", "odom_dyaw",
+                         "err_dx", "err_dy", "err_dyaw", "rx_mono", "ui_mono", "sim_reference_mono",
+                         "rx_age_ms", "physics_dt", "physics_overruns", "sim_reset_index",
+                         "odom_sequence", "comparison_index", "alignment")
+    comparison_writer = csv.DictWriter(comparison_handle, fieldnames=comparison_fields)
+    comparison_writer.writeheader()
+    latest_compare = ROOT / "output" / "odom_compare.csv"
+    if latest_compare.exists() and not latest_compare.is_symlink():
+        latest_compare.rename(latest_compare.with_name("odom_compare.before-%s.csv" % run_id))
+    latest_link = latest_compare.with_name(".odom_compare-%s" % run_id)
+    latest_link.symlink_to(comparison_path.relative_to(ROOT / "output"))
+    latest_link.replace(latest_compare)
+    if odom is not None:
+        odom.enable_trace(run_dir / "odom_rx.csv")
+    print("  odometry logs:", run_dir)
 
     look_offset = np.zeros(3, dtype=np.float64)
     follow = True
@@ -403,6 +418,8 @@ def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4
         renderer = _GodViewProxy(Path(world.config_path), stream, capture_scale)
     except Exception as exc:
         print("  live window skipped:", exc)
+        ctrl.close()
+        comparison_handle.close()
         pygame.quit()
         return 2
 
@@ -450,242 +467,294 @@ def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4
             strip.blit(tag, (i * cell_w + 6, 1))
         return strip
 
-    # Send the pose before the overview read, but do not read the camera
-    # result yet. Both pipes fill and deadlock if the reads are reversed.
-    if show_cams:
-        renderer.render_cameras(world.ego_pose, wait_ack=True, read_frames=False)
-    img = render_frame()
-    surf = rgb_surface(img, (god_w, god_h))
-    cam_strip = render_cam_strip(renderer.read_cameras()) if show_cams else None
-    next_camera = time.monotonic() + (1/stream.fps if stream else 0)
-    next_display = time.monotonic()
-    running = True
-    while running:
-        dt = clock.get_time() / 1000.0
-        if dt <= 0.0:
-            dt = 1.0 / 60.0
-        # A slow fisheye frame must still move the car by the time that passed.
-        dt = min(dt, 0.25)
+    # Ask for cameras before the blocking overview read. The camera process
+    # exits when its input stays idle until that read returns.
+    try:
+        cam_strip = render_cam_strip(renderer.render_cameras(world.ego_pose, wait_ack=True)) if show_cams else None
+        img = render_frame()
+        surf = rgb_surface(img, (god_w, god_h))
+        ctrl.start()
+        compare_ready_at = time.monotonic() + 2.0
+        next_compare_log = 0.0
+        last_compare_sequence = None
+        next_camera = time.monotonic() + (1/stream.fps if stream else 0)
+        next_display = time.monotonic()
+        running = True
+        while running:
+            dt = clock.get_time() / 1000.0
+            if dt <= 0.0:
+                dt = 1.0 / 60.0
+            # This dt controls camera navigation only. Physics runs in CAN TX.
+            dt = min(dt, 0.25)
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
-                elif event.key == pygame.K_f:
-                    follow = not follow
-                    if follow:
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                    elif event.key == pygame.K_f:
+                        follow = not follow
+                        if follow:
+                            look_offset[:] = 0.0
+                        dirty = True
+                    elif event.key == pygame.K_r:
+                        manual_gear = None
+                        ctrl.reset(ego0["x"], ego0["y"], ego0["yaw"], speed=0.0)
+                        ctrl.apply_to_world(world, z=0.0)
+                        odom_origin = None
+                        comparison_index += 1
+                        compare_ready_at = time.monotonic() + 2.0
                         look_offset[:] = 0.0
+                        follow = True
+                        az, el, radius, fov = 215.0, 18.0, 8.0, 40.0
+                        dirty = True
+                    elif event.key == pygame.K_b:
+                        odom_origin = None
+                        comparison_index += 1
+                        compare_ready_at = time.monotonic() + 0.2
+                    elif event.key == pygame.K_w:
+                        look_offset[0] += 0.4
+                        dirty = True
+                    elif event.key == pygame.K_s:
+                        look_offset[0] -= 0.4
+                        dirty = True
+                    elif event.key == pygame.K_a:
+                        look_offset[1] += 0.4
+                        dirty = True
+                    elif event.key == pygame.K_d:
+                        look_offset[1] -= 0.4
+                        dirty = True
+                    elif event.key == pygame.K_e:
+                        look_offset[2] += 0.3
+                        dirty = True
+                    elif event.key == pygame.K_x:
+                        look_offset[2] -= 0.3
+                        dirty = True
+                    elif event.key == pygame.K_c:
+                        show_cams = not show_cams
+                        dirty = True
+                    elif event.key in (pygame.K_1, pygame.K_KP1):
+                        manual_gear = "P"
+                    elif event.key in (pygame.K_2, pygame.K_KP2):
+                        manual_gear = "R"
+                    elif event.key in (pygame.K_3, pygame.K_KP3):
+                        manual_gear = "N"
+                    elif event.key in (pygame.K_4, pygame.K_KP4):
+                        manual_gear = "D"
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:
+                        dragging_orbit = True
+                    elif event.button == 3:
+                        dragging_pan = True
+                    elif event.button == 4:
+                        radius = max(2.0, radius * 0.90)
+                        dirty = True
+                    elif event.button == 5:
+                        radius = min(40.0, radius * 1.10)
+                        dirty = True
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        dragging_orbit = False
+                    elif event.button == 3:
+                        dragging_pan = False
+                elif event.type == pygame.MOUSEMOTION:
+                    dx, dy = event.rel
+                    if dragging_orbit:
+                        az = (az - dx * 0.35) % 360.0
+                        el = float(np.clip(el + dy * 0.25, -5.0, 85.0))
+                        dirty = True
+                    elif dragging_pan:
+                        tgt = look_at()
+                        eye = orbit_eye(tuple(tgt), az, el, radius)
+                        right, up_cam = _pan_axes(eye, tuple(tgt))
+                        scale = 0.0025 * radius
+                        look_offset -= right * dx * scale
+                        look_offset += up_cam * dy * scale
+                        dirty = True
+                elif event.type == pygame.MOUSEWHEEL:
+                    radius = float(np.clip(radius * (0.90 if event.y > 0 else 1.10), 2.0, 40.0))
                     dirty = True
-                elif event.key == pygame.K_r:
-                    manual_gear = None
-                    ctrl.reset(ego0["x"], ego0["y"], ego0["yaw"], speed=0.0)
-                    ctrl.apply_to_world(world, z=0.0)
-                    if can is not None:
-                        can.sync(ctrl.get_state())
-                    look_offset[:] = 0.0
-                    follow = True
-                    az, el, radius, fov = 215.0, 18.0, 8.0, 40.0
-                    dirty = True
-                elif event.key == pygame.K_w:
-                    look_offset[0] += 0.4
-                    dirty = True
-                elif event.key == pygame.K_s:
-                    look_offset[0] -= 0.4
-                    dirty = True
-                elif event.key == pygame.K_a:
-                    look_offset[1] += 0.4
-                    dirty = True
-                elif event.key == pygame.K_d:
-                    look_offset[1] -= 0.4
-                    dirty = True
-                elif event.key == pygame.K_e:
-                    look_offset[2] += 0.3
-                    dirty = True
-                elif event.key == pygame.K_x:
-                    look_offset[2] -= 0.3
-                    dirty = True
-                elif event.key == pygame.K_c:
-                    show_cams = not show_cams
-                    dirty = True
-                elif event.key in (pygame.K_1, pygame.K_KP1):
-                    manual_gear = "P"
-                elif event.key in (pygame.K_2, pygame.K_KP2):
-                    manual_gear = "R"
-                elif event.key in (pygame.K_3, pygame.K_KP3):
-                    manual_gear = "N"
-                elif event.key in (pygame.K_4, pygame.K_KP4):
-                    manual_gear = "D"
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:
-                    dragging_orbit = True
-                elif event.button == 3:
-                    dragging_pan = True
-                elif event.button == 4:
-                    radius = max(2.0, radius * 0.90)
-                    dirty = True
-                elif event.button == 5:
-                    radius = min(40.0, radius * 1.10)
-                    dirty = True
-            elif event.type == pygame.MOUSEBUTTONUP:
-                if event.button == 1:
-                    dragging_orbit = False
-                elif event.button == 3:
-                    dragging_pan = False
-            elif event.type == pygame.MOUSEMOTION:
-                dx, dy = event.rel
-                if dragging_orbit:
-                    az = (az - dx * 0.35) % 360.0
-                    el = float(np.clip(el + dy * 0.25, -5.0, 85.0))
-                    dirty = True
-                elif dragging_pan:
-                    tgt = look_at()
-                    eye = orbit_eye(tuple(tgt), az, el, radius)
-                    right, up_cam = _pan_axes(eye, tuple(tgt))
-                    scale = 0.0025 * radius
-                    look_offset -= right * dx * scale
-                    look_offset += up_cam * dy * scale
-                    dirty = True
-            elif event.type == pygame.MOUSEWHEEL:
-                radius = float(np.clip(radius * (0.90 if event.y > 0 else 1.10), 2.0, 40.0))
+
+            keys = pygame.key.get_pressed()
+            # Hold: = zoom in, - zoom out, [ lower pitch, ] raise pitch.
+            if keys[pygame.K_EQUALS] or keys[pygame.K_KP_PLUS]:
+                radius = max(2.0, radius * math.exp(-0.7 * dt))
+                dirty = True
+            if keys[pygame.K_MINUS] or keys[pygame.K_KP_MINUS]:
+                radius = min(40.0, radius * math.exp(0.7 * dt))
+                dirty = True
+            if keys[pygame.K_LEFTBRACKET]:
+                el = float(np.clip(el - 28.0 * dt, -5.0, 85.0))
+                dirty = True
+            if keys[pygame.K_RIGHTBRACKET]:
+                el = float(np.clip(el + 28.0 * dt, -5.0, 85.0))
+                dirty = True
+            st_now = ctrl.get_state()
+            vx = st_now.speed_mps
+            steer = 0.0
+            if keys[pygame.K_LEFT]:
+                steer += 380.0
+            if keys[pygame.K_RIGHT]:
+                steer -= 380.0
+            up = bool(keys[pygame.K_UP])
+            down = bool(keys[pygame.K_DOWN])
+            # Hold Space for the driver brake pedal. It must not also force N:
+            # slot selection needs D (or the chosen gear) while the pedal is down.
+            brake_held = bool(keys[pygame.K_SPACE])
+            if up and not down and not brake_held:
+                if vx < -0.08:
+                    gear, accel = "R", -3.2
+                else:
+                    gear, accel = "D", 1.8
+            elif down and not up and not brake_held:
+                if vx > 0.08:
+                    gear, accel = "D", -3.2
+                else:
+                    gear, accel = "R", 1.5
+            elif brake_held or abs(vx) > 0.03:
+                gear = manual_gear if manual_gear is not None else st_now.gear
+                if gear in ("P", "N"):
+                    gear = "D" if vx >= 0.0 else "R"
+                accel = -3.2 if brake_held else -1.4
+            else:
+                gear = manual_gear if manual_gear is not None else st_now.gear
+                accel = 0.0
+
+            # Keys latch manual intent. The CAN thread selects fresh ADAS controls
+            # on every sensor tick, including while this UI waits for the renderer.
+            ctrl.set_controls(steer, accel, gear, brake_pressed=brake_held)
+            st = ctrl.apply_to_world(world, z=0.0)
+            physics = ctrl.status()
+            source = physics["source"]
+            moving = abs(st.speed_mps) > 1e-4 or abs(steer) > 1e-3 or up or down
+            if moving:
                 dirty = True
 
-        keys = pygame.key.get_pressed()
-        st_now = ctrl.get_state()
-        vx = st_now.speed_mps
-        steer = 0.0
-        if keys[pygame.K_LEFT]:
-            steer += 380.0
-        if keys[pygame.K_RIGHT]:
-            steer -= 380.0
-        up = bool(keys[pygame.K_UP])
-        down = bool(keys[pygame.K_DOWN])
-        # Hold Space for the driver brake pedal. It must not also force N:
-        # slot selection needs D (or the chosen gear) while the pedal is down.
-        brake_held = bool(keys[pygame.K_SPACE])
-        if up and not down and not brake_held:
-            if vx < -0.08:
-                gear, accel = "R", -3.2
-            else:
-                gear, accel = "D", 1.8
-        elif down and not up and not brake_held:
-            if vx > 0.08:
-                gear, accel = "D", -3.2
-            else:
-                gear, accel = "R", 1.5
-        elif brake_held or abs(vx) > 0.03:
-            gear = manual_gear if manual_gear is not None else st_now.gear
-            if gear in ("P", "N"):
-                gear = "D" if vx >= 0.0 else "R"
-            accel = -3.2 if brake_held else -1.4
-        else:
-            gear = manual_gear if manual_gear is not None else st_now.gear
-            accel = 0.0
+            # Board mode refreshes the overview at the camera cadence, leaving
+            # the UI loop free to collect driving input between video frames.
+            if dirty and (not stream or time.monotonic() >= next_camera):
+                img = render_frame()
+                surf = rgb_surface(img, (god_w, god_h))
+                if show_cams and not stream:
+                    cam_strip = render_cam_strip()
+                dirty = False
 
-        # Arrows write every frame. A fresh Active ADAS_07 replaces them so
-        # the keyboard cannot cancel a latched command between CAN periods.
-        # The driver pedal stays independent of that takeover.
-        source = "keys"
-        command = None
-        if can is not None:
-            command = can.controls(st_now.gear)
-        if command is not None and not brake_held:
-            steer, accel, gear = command
-            source = "CAN"
-            up = down = False
-        ctrl.set_controls(steer, accel, gear)
-        st = ctrl.step(dt)
-        ctrl.apply_to_world(world, z=0.0)
-        if can is not None:
-            can.push(st, argparse.Namespace(accel=accel, brake_pressed=brake_held))
-        moving = abs(st.speed_mps) > 1e-4 or abs(steer) > 1e-3 or up or down
-        if moving:
-            dirty = True
+            if stream and time.monotonic() >= next_camera:
+                images = renderer.render_cameras(world.ego_pose)
+                if show_cams:
+                    cam_strip = render_cam_strip(images)
+                next_camera = max(next_camera + 1/stream.fps, time.monotonic())
 
-        # Board mode refreshes the overview at the camera cadence, leaving
-        # the UI loop free to collect driving input between video frames.
-        if dirty and (not stream or time.monotonic() >= next_camera):
-            img = render_frame()
-            surf = rgb_surface(img, (god_w, god_h))
-            if show_cams and not stream:
-                cam_strip = render_cam_strip()
-            dirty = False
-
-        if stream and time.monotonic() >= next_camera:
-            images = renderer.render_cameras(world.ego_pose)
-            if show_cams:
-                cam_strip = render_cam_strip(images)
-            next_camera = max(next_camera + 1/stream.fps, time.monotonic())
-
-        # A software VNC desktop need only repaint at the video cadence.
-        # Input, vehicle stepping and CAN publication keep their 60 Hz loop.
-        if stream and time.monotonic() < next_display:
+            # A software VNC desktop need only repaint at the video cadence.
+            # Physics and CAN keep running while rendering or display waits.
+            if stream and time.monotonic() < next_display:
+                clock.tick(60)
+                continue
+            screen.fill((8, 8, 10))
+            screen.blit(surf, (0, 0))
+            if show_cams and cam_strip is not None:
+                screen.blit(cam_strip, (0, god_h))
+            brake_txt = "DOWN" if brake_held else "up"
+            hud = [
+                "Arrows drive  Space=brake  1P 2R 3N 4D  =/- zoom  [/] pitch  F follow=%s  C cams=%s  R reset  B odom zero"
+                % ("on" if follow else "off", "on" if show_cams else "off"),
+                "gear %s  brake %s  v=%+.2f m/s  steer=%+.0f  yaw=%.0f  xy=(%.2f, %.2f)  %.0f UI Hz"
+                % (
+                    st.gear,
+                    brake_txt,
+                    st.speed_mps,
+                    st.steer_wheel_deg,
+                    math.degrees(st.yaw),
+                    st.x,
+                    st.y,
+                    clock.get_fps(),
+                ),
+            ]
+            hud.append("Physics/CAN 100 Hz target  dt=%.1f ms  late>20ms=%d  tick=%d" % (
+                physics["dt"] * 1000.0, physics["overruns"], physics["sequence"]))
+            if stream:
+                sent, send_fps, send_mbps = renderer.stream_stats
+                hud.append(f"Board SEND {send_fps:.2f} fps  {send_mbps:.2f} Mbps  frames={sent}"
+                           f"  target={stream.fps} fps/{stream.bitrate}  capture={capture_scale}x")
+            if can is not None:
+                info = can.status()
+                where = "dry" if info["dry"] else info["iface"]
+                if info["error"]:
+                    adas = "TX error: " + info["error"]
+                elif info["stale"]:
+                    adas = "no ADAS_07"
+                else:
+                    gear_name = {0: "hold", 1: "P", 2: "R", 3: "N", 4: "D"}.get(info["gear"], str(info["gear"]))
+                    adas = "ADAS_07 req crc=%s cnt=%s gear=%s steer=%+.0f acc=%+.2f vlc=%s eps=%s emg=%s stop=%s" % (
+                        "ok" if info["crc"] else "bad", info["counter"], gear_name,
+                        info["steer"], info["acc"], info["vlc"], info["eps"],
+                        info["emergency"], info["standstill_req"] or info["decel_to_stop"],
+                    )
+                vlc_name = {0: "off", 1: "standby", 2: "active"}.get(info.get("tx_vlc"), str(info.get("tx_vlc")))
+                hud.append("TX gear=%s(%s) brake=%s pos=%.0f%%  VLC rsp=%s st=%s  EPS=%s" % (
+                    {1: "P", 2: "R", 3: "N", 4: "D"}.get(info.get("tx_gear"), "?"),
+                    info.get("tx_gear"),
+                    "pressed" if info.get("tx_brake") in (1, 2) else "released",
+                    info.get("tx_brake_pos") or 0.0,
+                    vlc_name, info.get("tx_vlc_st"), info.get("tx_eps"),
+                ))
+                hud.append("CAN %s  drive=%s  frames=%d  %s" % (
+                    where, source, info["sent"], adas,
+                ))
+            if odom is not None:
+                sample, odom_error = odom.status()
+                if sample is None:
+                    hud.append("ODOM waiting" + ("" if not odom_error else "  " + odom_error))
+                else:
+                    compare_now = time.monotonic()
+                    rx_age_ms = (compare_now - sample["received_monotonic"]) * 1000.0
+                    reference_t, reference = ctrl.pose_at(sample["received_monotonic"])
+                    if (odom_origin is None and compare_now >= compare_ready_at and
+                            abs(st.speed_mps) < 0.02 and rx_age_ms < 500):
+                        odom_origin = {
+                            "x": sample["x"], "y": sample["y"], "yaw": sample["yaw"],
+                            "sim_x": reference.x, "sim_y": reference.y, "sim_yaw": reference.yaw,
+                        }
+                    from odom_compare import pose_error
+                    err = pose_error(reference.x, reference.y, reference.yaw, sample, odom_origin)
+                    if err is None:
+                        hud.append("ODOM baseline: keep stopped for 2s (B = rebase)")
+                    else:
+                        hud.append("SIM  dx=%+.3f dy=%+.3f dyaw=%+.2f deg" % (
+                            err["sim_dx"], err["sim_dy"], math.degrees(err["sim_dyaw"])))
+                        hud.append("ODOM dx=%+.3f dy=%+.3f dyaw=%+.2f deg  err=%+.3f %+.3f %+.2f" % (
+                            err["odom_dx"], err["odom_dy"], math.degrees(err["odom_dyaw"]),
+                            err["err_dx"], err["err_dy"], math.degrees(err["err_dyaw"])))
+                        if compare_now >= next_compare_log and sample["sequence"] != last_compare_sequence:
+                            next_compare_log = compare_now + 0.2
+                            last_compare_sequence = sample["sequence"]
+                            comparison_writer.writerow(dict(
+                                stamp=sample["stamp"], **err, rx_mono=sample["received_monotonic"],
+                                ui_mono=compare_now, sim_reference_mono=reference_t, rx_age_ms=rx_age_ms,
+                                physics_dt=physics["dt"], physics_overruns=physics["overruns"],
+                                sim_reset_index=physics["reset_index"], odom_sequence=sample["sequence"],
+                                comparison_index=comparison_index,
+                                alignment="local_receive_time"))
+                    hud.append("ODOM %s rx age=%.0f ms; receive-time comparison includes transport delay" % (
+                        "STALE" if rx_age_ms > 500 else "live", rx_age_ms))
+            y = 8
+            for line in hud:
+                text = font.render(line, True, (255, 230, 80), (0, 0, 0))
+                screen.blit(text, (8, y))
+                y += text.get_height() + 2
+            pygame.display.flip()
+            if stream:
+                next_display = max(next_display + 1/stream.fps, time.monotonic())
             clock.tick(60)
-            continue
-        screen.fill((8, 8, 10))
-        screen.blit(surf, (0, 0))
-        if show_cams and cam_strip is not None:
-            screen.blit(cam_strip, (0, god_h))
-        brake_txt = "DOWN" if brake_held else "up"
-        hud = [
-            "Arrows drive  hold Space=brake  1P 2R 3N 4D  LMB orbit  RMB pan  wheel zoom  F follow=%s  C cams=%s  R reset"
-            % ("on" if follow else "off", "on" if show_cams else "off"),
-            "gear %s  brake %s  v=%+.2f m/s  steer=%+.0f  yaw=%.0f  xy=(%.2f, %.2f)  %.0f control Hz"
-            % (
-                st.gear,
-                brake_txt,
-                st.speed_mps,
-                st.steer_wheel_deg,
-                math.degrees(st.yaw),
-                st.x,
-                st.y,
-                clock.get_fps(),
-            ),
-        ]
-        if stream:
-            sent, send_fps, send_mbps = renderer.stream_stats
-            hud.append(f"Board SEND {send_fps:.2f} fps  {send_mbps:.2f} Mbps  frames={sent}"
-                       f"  target={stream.fps} fps/{stream.bitrate}  capture={capture_scale}x")
-        if can is not None:
-            info = can.status()
-            where = "dry" if info["dry"] else info["iface"]
-            if info["error"]:
-                adas = "TX error: " + info["error"]
-            elif info["stale"]:
-                adas = "no ADAS_07"
-            else:
-                gear_name = {0: "hold", 1: "P", 2: "R", 3: "N", 4: "D"}.get(info["gear"], str(info["gear"]))
-                adas = "ADAS_07 req crc=%s cnt=%s gear=%s steer=%+.0f acc=%+.2f vlc=%s eps=%s emg=%s stop=%s" % (
-                    "ok" if info["crc"] else "bad", info["counter"], gear_name,
-                    info["steer"], info["acc"], info["vlc"], info["eps"],
-                    info["emergency"], info["standstill_req"] or info["decel_to_stop"],
-                )
-            vlc_name = {0: "off", 1: "standby", 2: "active"}.get(info.get("tx_vlc"), str(info.get("tx_vlc")))
-            hud.append("TX gear=%s(%s) brake=%s pos=%.0f%%  VLC rsp=%s st=%s  EPS=%s" % (
-                {1: "P", 2: "R", 3: "N", 4: "D"}.get(info.get("tx_gear"), "?"),
-                info.get("tx_gear"),
-                "pressed" if info.get("tx_brake") in (1, 2) else "released",
-                info.get("tx_brake_pos") or 0.0,
-                vlc_name, info.get("tx_vlc_st"), info.get("tx_eps"),
-            ))
-            hud.append("CAN %s  drive=%s  frames=%d  %s" % (
-                where, source, info["sent"], adas,
-            ))
-        y = 8
-        for line in hud:
-            text = font.render(line, True, (255, 230, 80), (0, 0, 0))
-            screen.blit(text, (8, y))
-            y += text.get_height() + 2
-        pygame.display.flip()
-        if stream:
-            next_display = max(next_display + 1/stream.fps, time.monotonic())
-        clock.tick(60)
 
-    renderer.close()
-    if can is not None:
-        can.close()
-    pygame.quit()
+    finally:
+        ctrl.close()
+        comparison_handle.close()
+        renderer.close()
+        if odom is not None:
+            odom.close()
+        pygame.quit()
     print("  window closed")
     return 0
 
@@ -700,6 +769,9 @@ def main(argv=None) -> int:
     parser.add_argument("--stream-host", help="send the same camera frames over TCP, e.g. a TX2 SSH tunnel")
     parser.add_argument("--stream-port", type=int, default=27164)
     parser.add_argument("--serial", default="")
+    parser.add_argument("--odom-adb", action="store_true",
+                        help="compare Android /davinci/apa/odometry wheel pose")
+    parser.add_argument("--odom-port", type=int, default=46000)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--bitrate", default="12M", help="total four-camera H264 bitrate")
     parser.add_argument("--encoder", choices=("vaapi", "jetson"), default="vaapi")
@@ -727,6 +799,15 @@ def main(argv=None) -> int:
     if args.can is not None and not (args.window or args.interactive):
         parser.error("--can requires --window or --interactive")
     stream = args if args.stream_adb or args.stream_host else None
+    odom_link = None
+    if args.odom_adb:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from odom_compare import OdomCompare
+        if not args.serial:
+            raise SystemExit("--odom-adb needs --serial")
+        odom_link = OdomCompare(args.serial, args.odom_port)
+        print("  odom: Android connects to TX2 tcp:%d" % args.odom_port)
+
     can_link = None
     if args.can is not None:
         sys.path.insert(0, str(ROOT / "scripts"))
@@ -758,6 +839,7 @@ def main(argv=None) -> int:
         if args.window:
             rc = try_interactive(
                 world, stream=stream, capture_scale=args.capture_scale, can=can_link,
+                odom=odom_link,
             )
             return rc
 
@@ -807,7 +889,8 @@ def main(argv=None) -> int:
         _save(out_dir / "bev.png", bev)
 
         if args.interactive:
-            try_interactive(world, stream=stream, capture_scale=args.capture_scale, can=can_link)
+            try_interactive(world, stream=stream, capture_scale=args.capture_scale, can=can_link,
+                            odom=odom_link)
 
         print("view_scene OK —", out_dir)
         print("This sim has no editor viewport; stills/GIF are the browse path.")
@@ -816,6 +899,8 @@ def main(argv=None) -> int:
     finally:
         if can_link is not None:
             can_link.close()
+        if odom_link is not None:
+            odom_link.close()
         if world is not None:
             world.release()
 

@@ -3,9 +3,10 @@
 # Pose origin: rear-axle center, vehicle / world FLU.
 
 vehicle:
-  wheelbase_m: 2.800            # vehicle_wheelbase 2800 mm
-  track_width_m: 1.544          # mean of front 1543 / rear 1546 mm
-  steering_ratio: 15.3          # steering_angle_ratio
+  # Retain the TX2 measurement baseline while diagnosing sensor timing.
+  wheelbase_m: 2.800
+  track_width_m: 1.544
+  steering_ratio: 15.3
   max_steer_wheel_deg: 500
   max_road_wheel_deg: 35
   max_accel_mps2: 2.0

@@ -48,6 +48,8 @@ class VehicleState:
         default_factory=lambda: [0.0, 0.0, 0.0, 0.0]
     )
     speed_signal_mps: float = 0.0
+    # None supports snapshots from external callers without model feedback.
+    yaw_rate_rps: Optional[float] = None
 
     # Convenience named aliases (same values as wheel_speed_mps[i])
     @property
@@ -80,6 +82,7 @@ def _to_vehicle_state(ks: KinematicState) -> VehicleState:
         wheel_pulse_count=list(ks.wheel_pulse_count),
         wheel_pulse_rate_hz=list(ks.wheel_pulse_rate_hz),
         speed_signal_mps=abs(ks.vx),
+        yaw_rate_rps=ks.yaw_rate_rps,
     )
 
 
@@ -111,9 +114,14 @@ class VehicleController:
     def dt_s(self) -> float:
         return self._dt_default
 
-    def reset(self, x: float, y: float, yaw: float, speed: float = 0.0) -> VehicleState:
-        """Reset pose / speed; clears pulses and sets gear to P, controls to 0."""
+    def reset(self, x: float, y: float, yaw: float, speed: float = 0.0,
+              preserve_pulses: bool = False) -> VehicleState:
+        """Reset pose/speed; a live CAN session can retain cumulative counters."""
+        counts, fractions = self._state.wheel_pulse_count[:], self._state._pulse_frac[:]
         reset_state(self._state, x, y, yaw, speed=speed)
+        if preserve_pulses:
+            self._state.wheel_pulse_count = counts
+            self._state._pulse_frac = fractions
         self._cmd_steer = 0.0
         self._cmd_accel = 0.0
         self._cmd_gear = "P"
