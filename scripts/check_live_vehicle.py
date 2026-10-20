@@ -2,6 +2,7 @@
 """Regression checks for live sensor timing; no CAN device or renderer needed."""
 from pathlib import Path
 import csv
+import json
 import math
 import socket
 import sys
@@ -11,11 +12,12 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from apa_can_bridge import (ADAS_07_CRC, CanLink, chassis_from_vehicle, crc8,
-                            get_bits, put_bits)
+from apa_can_bridge import (ADAS_07_CRC, FRAMES, CanLink, chassis_from_vehicle, crc8,
+                            get_bits, put_bits, set_tx_thread_nice)
 from live_vehicle import LiveVehicle
 from odom_compare import OdomCompare, pose_error
 from vehicle import VehicleState
+from check_can_timing import summarize
 
 
 def active_command():
@@ -40,6 +42,65 @@ def wait_for(predicate, timeout=2):
 
 
 def main():
+    periods = {name: period for name, _, _, period, _ in FRAMES}
+    assert periods['Airbag_02'] == periods['iBRS_01'] == 10
+    assert periods['iBRS_04'] == periods['iBRS_05'] == 20
+    # Exercise the actual send loop once with a fake socket, including the
+    # first full batch. All frames remain present; sensor frames queue first.
+    link = CanLink(dry_run=True)
+    queued = []
+
+    class Outbox:
+        def send(self, packet):
+            queued.append(int.from_bytes(packet[:4], 'little'))
+            if len(queued) == len(FRAMES):
+                link._stop.set()
+
+        def close(self):
+            pass
+
+    link.sock = Outbox()
+    try:
+        with patch('apa_can_bridge.set_tx_thread_nice', return_value=0):
+            link._transmit()
+        assert link.error is None, link.error
+        assert queued[:4] == [0x190, 0x20C, 0x0A0, 0x214]
+        assert sorted(queued) == sorted(f[1] for f in FRAMES)
+    finally:
+        link.close()
+    with patch('apa_can_bridge.open_can'), patch('apa_can_bridge.threading.Thread'), \
+            patch('apa_can_bridge.sys.getswitchinterval', return_value=.005), \
+            patch('apa_can_bridge.sys.setswitchinterval') as switch:
+        link = CanLink('unused', dry_run=False)
+        link.start()
+        switch.assert_called_once_with(.001)
+        link.close()
+        switch.reset_mock()
+        link = CanLink(dry_run=True)
+        link.start()
+        switch.assert_not_called()
+        link.close()
+    with patch('apa_can_bridge.os.setpriority') as direct, \
+            patch('apa_can_bridge.os.getpriority', return_value=-10), \
+            patch('apa_can_bridge.subprocess.run') as rtkit:
+        assert set_tx_thread_nice(100, 103, -10) == -10
+        direct.assert_called_once()
+        assert direct.call_args.args[1:] == (103, -10)
+        rtkit.assert_not_called()
+    with patch('apa_can_bridge.os.setpriority', side_effect=PermissionError), \
+            patch('apa_can_bridge.os.getpriority', return_value=-10), \
+            patch('apa_can_bridge.subprocess.run') as rtkit:
+        rtkit.return_value.returncode = 0
+        assert set_tx_thread_nice(100, 103, -10) == -10
+        assert rtkit.call_args.args[0][-3:] == ['100', '103', '-10']
+        rtkit.return_value.returncode = 1
+        rtkit.return_value.stderr = 'denied'
+        try:
+            set_tx_thread_nice(100, 103, -10)
+        except RuntimeError as exc:
+            assert str(exc) == 'denied'
+        else:
+            raise AssertionError('priority rejection was hidden')
     # The current yaw rate must remain correct on the first frame and when
     # the preceding UI interval had a different duration or crossed +/-pi.
     current = VehicleState(yaw=math.radians(.2), yaw_rate_rps=0.)
@@ -49,6 +110,11 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix='tx2-live-check-') as temp:
         out = Path(temp)
+        capture = out / 'timing.candump'
+        capture.write_text(''.join('(%.6f) can0 190##10000\n' % t for t in (1, 1.01, 1.02, 1.04)))
+        timing = summarize(capture)['Airbag_02']
+        assert timing['frames'] == 4 and timing['gaps_over_1_5_periods'] == 1
+        assert abs(timing['max_ms'] - 20) < .001
         link = CanLink(dry_run=True)
         runtime = LiveVehicle(ROOT / 'configs/j01_vehicle.yaml', dict(x=0., y=0., yaw=0.),
                               link, out / 'deterministic')
@@ -99,6 +165,8 @@ def main():
         finally:
             runtime.close()
         assert not link._tx.is_alive()
+        metadata = json.loads((out / 'threaded/can_thread.json').read_text())
+        assert metadata['tid'] == link._tx.native_id and metadata['error'] is None
         truth = list(csv.DictReader((out / 'threaded/sim_truth.csv').open()))
         sent = list(csv.DictReader((out / 'threaded/can_tx.csv').open()))
         assert len(truth) >= 15
@@ -143,6 +211,7 @@ def main():
         assert not odom._thread.is_alive()
         assert len(list(csv.DictReader((out / 'odom_rx.csv').open()))) == 1
     print('PASS: instantaneous yaw rate, rear-wheel mean, pulse-preserving reset, yaw interpolation')
+    print('PASS: DBC periods, sensor-first order, GIL interval, per-thread priority/RTKit')
     print('PASS: physics/CAN continue through UI stalls; ADAS takeover, brake override, expiry')
     print('PASS: sent CAN yaw matches truth; session traces and timestamped ODOM reception')
 

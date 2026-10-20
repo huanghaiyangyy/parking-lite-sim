@@ -14,6 +14,7 @@ from pathlib import Path
 import socket
 import threading
 import time
+from odom_trace import TraceCsvWriter
 
 
 class OdomCompare:
@@ -27,6 +28,7 @@ class OdomCompare:
         self._trace = None
         self._trace_writer = None
         self._sequence = 0
+        self._mcu_trace = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -41,6 +43,9 @@ class OdomCompare:
             if self._trace is not None:
                 self._trace.close()
                 self._trace = self._trace_writer = None
+            if self._mcu_trace is not None:
+                self._mcu_trace.close()
+                self._mcu_trace = None
 
     def enable_trace(self, path):
         with self._lock:
@@ -48,6 +53,7 @@ class OdomCompare:
             self._trace_writer = csv.writer(self._trace)
             self._trace_writer.writerow(("rx_mono", "rx_wall", "sequence", "stamp", "x_wheel",
                                          "y_wheel", "yaw_wheel", "x", "y", "yaw"))
+            self._mcu_trace = TraceCsvWriter(Path(path).with_name('mcu_odom_trace.csv'))
 
     def _run(self):
         # Android odom_relay connects here. adb reverse cannot bind this port.
@@ -92,6 +98,11 @@ class OdomCompare:
             server.close()
 
     def _take(self, line):
+        if line.startswith(b'ODT1 '):
+            with self._lock:
+                if self._mcu_trace is not None:
+                    self._mcu_trace.take(line)
+            return
         parts = line.split()
         if len(parts) != 7:
             return

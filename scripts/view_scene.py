@@ -334,6 +334,18 @@ class _GodViewProxy:
                 proc.kill()
 
 
+def rgb_surface(arr: np.ndarray, size=None):
+    """Convert RGB through SDL; avoid the per-pixel surfarray copy under the GIL."""
+    import pygame
+
+    if size is not None and (arr.shape[1], arr.shape[0]) != size:
+        src = Image.fromarray(np.ascontiguousarray(arr), "RGB")
+        arr = np.asarray(src.resize(size, Image.Resampling.BILINEAR))
+    h, w = arr.shape[:2]
+    # Convert into an owned display-format surface, preserving row pitch.
+    return pygame.image.frombuffer(np.ascontiguousarray(arr), (w, h), "RGB").convert()
+
+
 def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4, can=None,
                     odom=None) -> int:
     """Draggable orbit window. LMB orbit, RMB pan, wheel zoom."""
@@ -433,17 +445,6 @@ def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4
         tgt = look_at()
         eye = orbit_eye(tuple(tgt), az, el, radius)
         return renderer.render(world.ego_pose, eye, tuple(tgt), fov)
-
-    def rgb_surface(arr: np.ndarray, size=None) -> "pygame.Surface":
-        # 24-bit RGB blits onto this 32-bit window with the wrong pitch and
-        # shows as stripes. Copy into a surface that matches the display.
-        if size is not None and (arr.shape[1], arr.shape[0]) != size:
-            src = Image.fromarray(np.ascontiguousarray(arr), "RGB")
-            arr = np.asarray(src.resize(size, Image.Resampling.BILINEAR))
-        h, w = arr.shape[:2]
-        surf = pygame.Surface((w, h)).convert()
-        pygame.surfarray.blit_array(surf, np.transpose(arr, (1, 0, 2)))
-        return surf
 
     def render_cam_strip(images=None) -> pygame.Surface:
         if images is None:

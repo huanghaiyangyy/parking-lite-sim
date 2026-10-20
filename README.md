@@ -95,7 +95,7 @@ python scripts/run_demo.py
 |------|------|
 | `configs/default.yaml` | 场景、车辆尺寸、四相机 K/D/外参、BEV 范围、god_view、render |
 | `configs/vehicle.yaml` | 运动学控制参数（轴距、转向比、轮半径、脉冲等） |
-| `configs/j01.yaml` | **本车 J01**：Kannala–Brandt 内参 + VFF 平均外参，后轴原点 |
+| `configs/j01.yaml` | **本车 J01**：VFF-44 台架 Kannala–Brandt 内外参，与 QNX 持久化标定一致，后轴原点 |
 | `configs/j01_vehicle.yaml` | J01 运动学（轴距 2.800 m、转向比 15.3、轮半径 0.334 m） |
 
 本车参数入口：
@@ -374,10 +374,36 @@ rtk proxy /home/huang/tx2-sim-venv/bin/python scripts/check_live_vehicle.py
 
 窗口把 `LiveVehicle.tick` 注册到 CAN 线程，按各报文的 10/20/40/50/100/1000 ms 周期发送；渲染等待期间车辆与反馈继续更新。发送线程自身延迟时跳过错过的发送周期，避免集中补发，原有 `CanLink.push()` 调用方式仍兼容。首次发送全套基线帧。接收线程只解析标准数据帧 ADAS_07（0x226、8 字节），CRC 通过且 100 ms 内的请求才参与握手和控制；VLC/EPS 为 Active 时覆盖键盘控制，R 档车体加速度翻为沿档位方向的踏板量。应急/停车覆盖后的实际目标也用于底盘回包。退出或初始化失败会关闭 CAN 线程与套接字。
 
+CAN 实发模式默认只将共享发送/物理线程提升到 `nice=-10`，不提高窗口和渲染线程的优先级，也不改变 Cockpit DBC 周期：
+
+| 传感器量 | 报文 / ID | 周期 |
+| --- | --- | ---: |
+| yaw rate | Airbag_02 / 0x190 | 10 ms |
+| 四轮脉冲计数 | iBRS_04 / 0x20C | 20 ms |
+| 四轮轮速值 | iBRS_01 / 0x0A0 | 10 ms |
+| 轮速方向 | iBRS_05 / 0x214 | 20 ms |
+
+先尝试直接设置线程 nice；权限不足时使用 TX2 桌面已有的 RTKit。应从桌面会话运行窗口入口，SSH 会话可能被 RTKit 拒绝。每轮日志的 `can_thread.json` 记录 PID、TID、请求与实际 nice、错误；失败时显式记录并保持普通调度，CAN 发送继续。`TX2_CAN_TX_NICE=0` 可进行原优先级对照。此处仍是普通分时调度，Python GIL、锁等待和总线排队仍可能引入抖动。
+
+发送路径使用 CRC-8/2F 查表及 little-endian 整数位运算，减少逐位 Python 循环。同批到期报文仍使用同一状态快照，优先入队 yaw rate、轮速脉冲、轮速值和方向帧；其他帧保留相对顺序和各自周期。启动真实 CAN 发送时，将本进程 Python GIL 切换间隔限制在最多 1 ms，减轻 UI 线程持有 GIL 对发送的阻塞；该值记录在 `can_thread.json` 的 `gil_switch_interval_s`，dry-run 不修改它。此设置影响同一进程的 Python 线程，不影响独立渲染 worker，仍不保证硬实时。
+
+`scripts/check_can_encoding.py` 用旧逐位算法校验随机位域、CRC、完整报文及计数器，并报告整批编码耗时；不打开 CAN，也不改变报文分辨率、脉冲标定或 DBC 周期。
+
+窗口预览使用 `pygame.image.frombuffer(...).convert()` 转为显示格式，替代 `surfarray.blit_array` 的逐像素拷贝，降低主线程占用及其对 CAN 线程的阻塞。保留原缩放、RGB 值和独立像素存储；`scripts/check_window_pixels.py` 可在 dummy 显示下检查奇数行宽、非连续数组、缩放和源数组生命周期。
+
+用工作站被动采样 TX2 的 SocketCAN 时间戳，不额外发送报文：
+
+```bash
+rtk proxy ssh huang@192.168.168.107 '/home/huang/tx2-sim-venv/bin/python /home/huang/tx2-sim/scripts/check_can_timing.py --seconds 30 --out /home/huang/tx2-sim/output/can-priority/after.json'
+```
+
+输出原始 `.candump` 和各报文周期的均值、P95/P99、最大值、P99 绝对抖动及超过 1.5 倍周期的间隙数。它统计 TX2 内核接收/发送回显时间，不等于 MCU 接收时间；`can_tx.csv` 也只是应用层发送记录。MCU 定位误差需按同一路径、停车残差及 MCU 原始采样时间另行比较。
+
 本地检查不打开 CAN，使用项目 Python 环境：
 
 ```bash
 rtk proxy /home/huang/Documents/parking-lite-sim/.venv/bin/python scripts/apa_can_bridge.py --check
+rtk proxy /home/huang/Documents/parking-lite-sim/.venv/bin/python scripts/check_can_encoding.py
 rtk proxy /home/huang/Documents/parking-lite-sim/.venv/bin/python scripts/apa_can_bridge.py --sim --seconds 1
 rtk proxy /home/huang/Documents/parking-lite-sim/.venv/bin/python scripts/view_window.py --can dry
 ```
@@ -449,3 +475,10 @@ rtk proxy ssh -N -o ExitOnForwardFailure=yes \
 rtk proxy python3 /home/huang/fawvw_apa_env/src/tools/ais_camera_tools/scripts/video_stream_board.py restore \
   --serial 5e9350b6 --state /home/huang/work/tx2-fullchain-20261014/board-session.json
 ```
+
+### 墙体、路沿材质与锥桶占位
+
+默认启用混凝土/沥青材质与简化光照，在 map 场景两个空车位内各增加两只橙白锥桶。
+`render.lighting_style: shadowed` 可恢复几何投影阴影、高光和雾效。
+原有几何与相机参数保持一致，可用 `render.material_style: flat` 对比原光照。
+配置、对比图导出及验证边界见 [场景材质与占位锥桶](docs/场景材质与占位锥桶.md)。

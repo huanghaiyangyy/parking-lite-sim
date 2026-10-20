@@ -20,8 +20,10 @@ import argparse
 import csv
 import json
 import math
+import os
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -42,36 +44,35 @@ GEAR_TO_SIM = {GEAR_P: "P", GEAR_R: "R", GEAR_N: "N", GEAR_D: "D"}
 DIR_FORWARD, DIR_BACKWARD, DIR_STOP = 1, 2, 3
 
 
+def _crc8_lut():
+    values = []
+    for crc in range(256):
+        for _ in range(8):
+            crc = ((crc << 1) & 0xFF) ^ (0x2F if crc & 0x80 else 0)
+        values.append(crc)
+    return tuple(values)
+
+
+CRC8_LUT = _crc8_lut()
+
+
 def crc8(data, counter, table):
     """CRC-8/2F plus the per-counter table from the Cockpit DBC."""
     crc = 0xFF
     for byte in data[1:]:
-        crc ^= byte
-        for _ in range(8):
-            crc = ((crc << 1) & 0xFF) ^ 0x2F if crc & 0x80 else (crc << 1) & 0xFF
-    crc ^= table[counter & 0x0F]
-    for _ in range(8):
-        crc = ((crc << 1) & 0xFF) ^ 0x2F if crc & 0x80 else (crc << 1) & 0xFF
-    return (~crc) & 0xFF
+        crc = CRC8_LUT[crc ^ byte]
+    return CRC8_LUT[crc ^ table[counter & 0x0F]] ^ 0xFF
 
 
 def put_bits(buf, start, length, value):
-    value &= (1 << length) - 1
-    for bit in range(length):
-        pos = start + bit
-        if (value >> bit) & 1:
-            buf[pos // 8] |= 1 << (pos % 8)
-        else:
-            buf[pos // 8] &= ~(1 << (pos % 8))
+    mask = (1 << length) - 1
+    packed = int.from_bytes(buf, "little")
+    packed = (packed & ~(mask << start)) | ((value & mask) << start)
+    buf[:] = packed.to_bytes(len(buf), "little")
 
 
 def get_bits(buf, start, length):
-    value = 0
-    for bit in range(length):
-        pos = start + bit
-        if buf[pos // 8] & (1 << (pos % 8)):
-            value |= 1 << bit
-    return value
+    return (int.from_bytes(buf, "little") >> start) & ((1 << length) - 1)
 
 
 def raw_linear(physical, factor, offset, length):
@@ -512,6 +513,25 @@ def encode_due(state, adas, counters, tick_ms=0):
                          (frame for frame in FRAMES if tick_ms % frame[3] == 0))
 
 
+def set_tx_thread_nice(pid, tid, nice):
+    """Raise only the CAN TX thread; RTKit supports an unprivileged desktop."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, tid, nice)
+    except PermissionError:
+        result = subprocess.run([
+            "gdbus", "call", "--system", "--dest", "org.freedesktop.RealtimeKit1",
+            "--object-path", "/org/freedesktop/RealtimeKit1", "--method",
+            "org.freedesktop.RealtimeKit1.MakeThreadHighPriorityWithPID",
+            "--", str(pid), str(tid), str(nice),
+        ], capture_output=True, text=True, timeout=3)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "RTKit rejected CAN TX priority")
+    actual = os.getpriority(os.PRIO_PROCESS, tid)
+    if actual != nice:
+        raise RuntimeError("CAN TX nice is %d, requested %d" % (actual, nice))
+    return actual
+
+
 class CanLink:
     """Chassis TX and ADAS_07 RX sharing the window's vehicle.
 
@@ -536,6 +556,11 @@ class CanLink:
         self._state_provider = None
         self._trace = None
         self._trace_writer = None
+        # Preserve DBC periods; prioritize the shared sensor/physics TX thread.
+        self.tx_nice = int(os.environ.get("TX2_CAN_TX_NICE", "0" if self.dry_run else "-10"))
+        if not -20 <= self.tx_nice <= 19:
+            raise ValueError("TX2_CAN_TX_NICE must be between -20 and 19")
+        self._tx_priority = None
         if not self.dry_run:
             self.sock = open_can(iface)
             self._rx = threading.Thread(
@@ -560,15 +585,34 @@ class CanLink:
                 raise RuntimeError("install state provider before starting TX")
             self._state_provider = state_provider
         if self._tx is None:
-            self._tx = threading.Thread(target=self._transmit, daemon=True)
+            if not self.dry_run:
+                # A high-priority TX thread still waits for Python's GIL.
+                sys.setswitchinterval(min(sys.getswitchinterval(), 0.001))
+            self._tx = threading.Thread(target=self._transmit, name="can-tx", daemon=True)
             self._tx.start()
 
     def _transmit(self):
+        tid = threading.get_native_id()
+        priority = dict(pid=os.getpid(), tid=tid, requested_nice=self.tx_nice, error=None,
+                        gil_switch_interval_s=sys.getswitchinterval())
+        try:
+            priority["nice"] = set_tx_thread_nice(os.getpid(), tid, self.tx_nice)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            priority.update(nice=os.getpriority(os.PRIO_PROCESS, tid), error=str(exc))
+        self._tx_priority = priority
+        if self._trace is not None:
+            Path(self._trace.name).with_name("can_thread.json").write_text(
+                json.dumps(priority, indent=2) + "\n")
+        if not self.dry_run:
+            print("CAN TX thread: " + json.dumps(priority), file=sys.stderr, flush=True)
+        # Queue odometry sensors before other frames from the same snapshot.
+        sensor_order = {"Airbag_02": 0, "iBRS_04": 1, "iBRS_01": 2, "iBRS_05": 3}
+        tx_frames = sorted(FRAMES, key=lambda frame: sensor_order.get(frame[0], 4))
         deadlines = {name: time.monotonic() for name, *_ in FRAMES}
         try:
             while not self._stop.is_set():
                 now = time.monotonic()
-                frames = [frame for frame in FRAMES if now >= deadlines[frame[0]]]
+                frames = [frame for frame in tx_frames if now >= deadlines[frame[0]]]
                 if self._state_provider is not None and any(f[0] == "Airbag_02" for f in frames):
                     vehicle, command, dt = self._state_provider(now)
                     self.push(vehicle, command, dt=dt)
@@ -642,6 +686,7 @@ class CanLink:
             "iface": self.iface,
             "error": self.error,
             "sent": sum(self.sent.values()),
+            "tx_thread": self._tx_priority,
             "stamp": got["stamp"],
             "crc": got["crc_ok"],
             "stale": got["stale"],

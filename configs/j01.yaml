@@ -1,12 +1,13 @@
-# J01 / 8155 舱泊一体 — 本车 Kannala–Brandt 四路鱼眼 + VFF 平均外参
+# J01 / 8155 舱泊一体 — 本车 Kannala–Brandt 四路鱼眼 + VFF-44 台架标定
 # Frame: vehicle FLU, origin = rear axle center (matches extrinsic.txt)
-# Camera K/D: EEPROM YAML (cv2.fisheye / Kannala–Brandt D=[k1,k2,k3,k4])
-# Extrinsics: VFF 7-group average, P_veh = R_cv @ P_opencv + t (t in mm → m)
+# Camera K/D: VFF-44 camera calibration YAML (cv2.fisheye / Kannala–Brandt D=[k1,k2,k3,k4])
+# Extrinsics: VFF-44 bench calibration, P_veh = R_cv @ P_opencv + t (t in mm → m)
 #
 # Sources (fawvw_apa_env):
-#   avm_projection/camera_params/{front,left,right,rear}_camera_calib.yaml
-#   avm_projection/avm_vff_avg.py  CALIB / VehicleOptions
-#   apa_docs/.../AVM全景影像分析.md  VehicleOptions
+#   manifest/tools/avm_calibration/camera_params/{front,left,right,rear}_camera_calib.yaml
+#   manifest/tools/avm_calibration/camera_params/extrinsic.txt
+#   manifest/tools/avm_calibration/avm_apa_params/config.yaml
+# Matches QNX /persist/profiles/avm/calibration (verified 2026-10-19).
 #
 # Run: python scripts/run_demo.py --config configs/j01.yaml --out output/j01
 
@@ -14,7 +15,7 @@ project:
   name: parking-lite-j01
   phase: 5
   vehicle_id: j01
-  calib_set: vff_avg_7
+  calib_set: vff_44
 
 frame:
   convention: vehicle_FLU
@@ -62,8 +63,8 @@ cameras:
   # K/D identical across four cameras on this vehicle (EEPROM copy).
   front:
     name: front
-    translation_m: [3.706827, -0.007727, 0.592542]
-    rotation_deg: [-1.4555, 20.8730, -0.2347]
+    translation_m: [3.704797225420, -0.003713827477, 0.598901548534]
+    rotation_deg: [-0.690113184685, 20.948642378042, -0.117894396383]
     K: [[313.615051, 0.0, 637.134766],
         [0.0, 313.659821, 483.579956],
         [0.0, 0.0, 1.0]]
@@ -71,8 +72,8 @@ cameras:
 
   rear:
     name: rear
-    translation_m: [-1.074920, 0.040276, 0.802915]
-    rotation_deg: [0.1119, 31.4497, -179.9763]
+    translation_m: [-1.069216649370, 0.040917210289, 0.799958103658]
+    rotation_deg: [0.718757414208, 32.232498537922, -178.995406378363]
     K: [[313.615051, 0.0, 637.134766],
         [0.0, 313.659821, 483.579956],
         [0.0, 0.0, 1.0]]
@@ -80,8 +81,8 @@ cameras:
 
   left:
     name: left
-    translation_m: [2.050266, 1.044171, 1.020553]
-    rotation_deg: [-0.6427, 29.8387, 93.1715]
+    translation_m: [2.047554785274, 1.046903295973, 1.013506613906]
+    rotation_deg: [-1.348075523074, 30.417838654270, 93.051421043939]
     K: [[313.615051, 0.0, 637.134766],
         [0.0, 313.659821, 483.579956],
         [0.0, 0.0, 1.0]]
@@ -89,8 +90,8 @@ cameras:
 
   right:
     name: right
-    translation_m: [2.028323, -1.036311, 1.025203]
-    rotation_deg: [-0.5542, 29.6786, -92.7884]
+    translation_m: [2.024928454549, -1.035558969497, 1.034808981395]
+    rotation_deg: [-0.734704203980, 29.449789845158, -93.096861316382]
     K: [[313.615051, 0.0, 637.134766],
         [0.0, 313.659821, 483.579956],
         [0.0, 0.0, 1.0]]
