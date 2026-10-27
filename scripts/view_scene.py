@@ -306,8 +306,12 @@ class _GodViewProxy:
         self._send(self.god, " ".join("%.6f" % v for v in vals) + "\n")
         return self._read_frame(self.god)
 
-    def render_cameras(self, ego, wait_ack=False) -> dict:
+    def render_cameras(self, ego, wait_ack=False, source_mono_us=None) -> dict:
         vals = [float(ego["x"]), float(ego["y"]), float(ego["z"]), float(ego["yaw"])]
+        if self.streaming:
+            if source_mono_us is None:
+                raise ValueError("streaming cameras require the physics pose source time")
+            vals.append(int(source_mono_us))
         self._send(self.cams, " ".join("%.6f" % v for v in vals) + "\n")
         if wait_ack:
             # The camera worker prints this after reading the command, before
@@ -446,9 +450,15 @@ def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4
         eye = orbit_eye(tuple(tgt), az, el, radius)
         return renderer.render(world.ego_pose, eye, tuple(tgt), fov)
 
+    def capture_cameras(wait_ack=False):
+        source_time, state = ctrl.timed_state()
+        pose = dict(x=state.x, y=state.y, z=0.0, yaw=state.yaw)
+        return renderer.render_cameras(pose, wait_ack=wait_ack,
+                                       source_mono_us=round(source_time * 1000000))
+
     def render_cam_strip(images=None) -> pygame.Surface:
         if images is None:
-            images = renderer.render_cameras(world.ego_pose)
+            images = capture_cameras()
         names = list(renderer.cam_names)
         cell_w = god_w // max(1, len(names))
         strip = pygame.Surface((god_w, cam_strip_h))
@@ -471,7 +481,7 @@ def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4
     # Ask for cameras before the blocking overview read. The camera process
     # exits when its input stays idle until that read returns.
     try:
-        cam_strip = render_cam_strip(renderer.render_cameras(world.ego_pose, wait_ack=True)) if show_cams else None
+        cam_strip = render_cam_strip(capture_cameras(wait_ack=True)) if show_cams else None
         img = render_frame()
         surf = rgb_surface(img, (god_w, god_h))
         ctrl.start()
@@ -642,7 +652,7 @@ def try_interactive(world: World, size=(1280, 800), stream=None, capture_scale=4
                 dirty = False
 
             if stream and time.monotonic() >= next_camera:
-                images = renderer.render_cameras(world.ego_pose)
+                images = capture_cameras()
                 if show_cams:
                     cam_strip = render_cam_strip(images)
                 next_camera = max(next_camera + 1/stream.fps, time.monotonic())

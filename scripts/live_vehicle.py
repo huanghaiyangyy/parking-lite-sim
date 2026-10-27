@@ -53,6 +53,11 @@ class LiveVehicle:
         with self._lock:
             return self._ctrl.get_state()
 
+    def timed_state(self):
+        """Return a physics pose and its source time from the same locked sample."""
+        with self._lock:
+            return self._history[-1]
+
     def status(self):
         with self._lock:
             return dict(sequence=self.sequence, reset_index=self.reset_index, dt=self.dt,

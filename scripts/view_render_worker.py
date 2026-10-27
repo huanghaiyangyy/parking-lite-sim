@@ -7,13 +7,14 @@ fbo.read returns zeros. This process owns GL only and has no DISPLAY.
 
 Commands (one line each):
   god x y z yaw ex ey ez tx ty tz 0 fov
-  cams x y z yaw
+  cams x y z yaw [physics_source_mono_us (required when streaming)]
   quit
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import socket
 import struct
@@ -99,6 +100,7 @@ def _scaled_rig(world: World, scale: float):
 def stream_cameras(world, args):
     """Own the GL/encoder cadence; a slow preview consumer cannot delay video."""
     import cv2
+    from scripts.board_clock import BoardClock
     from stream_h264_adb import Encoder, JetsonEncoder, SEND_STATUS, connect_adb
     cv2.setNumThreads(2)
     width, height = world.rig.image_size
@@ -109,6 +111,11 @@ def stream_cameras(world, args):
             if args.host else connect_adb(args.serial, args.port))
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.settimeout(10)
+    clock = None
+    if not args.local_clock:
+        clock = BoardClock(args.serial, args.port + 1, timeout_s=8.0)
+        print("8155 clock mapped rtt_us=%d board_us=%d" % (clock.rtt_us, clock.now_us()),
+              file=sys.stderr, flush=True)
     encoder_cls = JetsonEncoder if args.encoder == "jetson" else Encoder
     encoder = encoder_cls(width*2, height*2, args.fps, args.bitrate, sock.sendall)
     condition, stopped = threading.Condition(), threading.Event()
@@ -122,8 +129,8 @@ def stream_cameras(world, args):
                 if line == "quit":
                     break
                 requested = tuple(float(v) for v in line.split())
-                if len(requested) != 4:
-                    raise ValueError("camera command requires x y z yaw")
+                if len(requested) != 5 or not all(np.isfinite(requested)):
+                    raise ValueError("streaming camera command requires x y z yaw source_mono_us")
                 if snapshot is None:
                     ack = os.environ.get("SIM_ACK_FD")
                     if ack:
@@ -150,29 +157,56 @@ def stream_cameras(world, args):
     sys.stdout.buffer.write(("ready %s\n" % " ".join(world.rig.names)).encode())
     sys.stdout.buffer.flush()
     io.start()
+    timing_path = ROOT / "output" / ("frame-timing-%d.csv" % os.getpid())
+    timing_file = timing_path.open("w", newline="", buffering=1)
+    timing = csv.writer(timing_file)
+    timing.writerow(("seq", "source_mono_us", "pts_us", "render_start_mono_us",
+                     "read_done_mono_us", "clock_rtt_us", "clock", "x", "y", "yaw"))
+    print("frame timing: %s" % timing_path, file=sys.stderr, flush=True)
     try:
         with condition:
             condition.wait_for(lambda: pose is not None or stopped.is_set())
-        start_ns, report, seq = time.monotonic_ns(), time.monotonic(), 0
+        report, seq = time.monotonic(), 0
         next_frame = time.monotonic()
         report_sent, report_bytes, send_fps, send_mbps = 0, 0, 0.0, 0.0
         stage_ms, stage_frames = np.zeros(4), 0
+        last_source_us = -1
+        local_origin_us = None
         while not stopped.wait(max(0, next_frame-time.monotonic())):
             with condition:
-                captured_pose = pose
+                captured_pose, source_us = pose[:4], int(pose[4])
+            if source_us <= last_source_us:
+                next_frame = time.monotonic() + 1/args.fps
+                continue  # Do not invent a new capture time for the same physics sample.
             tick_ns = time.monotonic_ns()
+            if local_origin_us is None:
+                local_origin_us = source_us
+            try:
+                render_us = clock.to_board_us(source_us) if clock else source_us-local_origin_us
+            except RuntimeError as exc:
+                # Stop publishing on a stale mapping, but keep preview/control
+                # IPC alive while the sampler recovers.
+                if time.monotonic() - report >= 1:
+                    print("stream paused: %s" % exc, file=sys.stderr, flush=True)
+                    report = time.monotonic()
+                next_frame = time.monotonic() + 1/args.fps
+                continue
             world.set_ego_pose(*captured_pose)
             if args.encoder == "jetson":
                 world.draw_camera_grid()
                 drawn = time.monotonic()
                 raw = world.read_camera_grid_rgba()
                 read = time.monotonic()
-                encoder.push(seq, (tick_ns-start_ns)//1000, raw)
+                encoder.push(seq, render_us, raw)
                 grid = None
             else:
                 grid = world.render_camera_grid()
                 drawn = read = time.monotonic()
-                encoder.push(seq, (tick_ns-start_ns)//1000, grid)
+                encoder.push(seq, render_us, grid)
+            timing.writerow((seq, source_us, render_us, tick_ns//1000, round(read*1000000),
+                             clock.rtt_us if clock else 0, "8155-boot" if clock else "tx2-local",
+                             captured_pose[0], captured_pose[1], captured_pose[3]))
+            last_source_us = source_us
             submitted = time.monotonic()
             if args.encoder == "jetson":
                 small = world.read_camera_grid_preview()
@@ -209,6 +243,9 @@ def stream_cameras(world, args):
         if encoder.proc.poll() is None:
             encoder.proc.kill(); encoder.proc.wait()
         sock.close()
+        if clock:
+            clock.close()
+        timing_file.close()
         world.release()
     return 0
 
@@ -222,6 +259,7 @@ def main() -> int:
     parser.add_argument("--host", help="direct TCP destination for the stream")
     parser.add_argument("--port", type=int, default=27164)
     parser.add_argument("--capture-scale", type=int, choices=(1, 2, 4))
+    parser.add_argument("--local-clock", action="store_true")
     parser.add_argument("--encoder", choices=("vaapi", "jetson"), default="vaapi")
     args = parser.parse_args()
     if not 1 <= args.fps <= 30:

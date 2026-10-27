@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from scripts.board_clock import BoardClock
 HEADER = struct.Struct("<4sBBHBBIQIHH")
 SEND_STATUS = struct.Struct("<QddQ4d")  # sent, fps, Mbps, preview sequence, capture pose
 MAX_PAYLOAD = 4 * 1024 * 1024
@@ -312,6 +313,8 @@ def main(argv=None):
     p.add_argument("--frame-log", type=Path,
                    help="JSONL of source and send monotonic timestamps, one record per AU")
     p.add_argument("--encoder", choices=("vaapi", "jetson"), default="vaapi")
+    p.add_argument("--local-clock", action="store_true",
+                   help="stamp frames with TX2 monotonic time; default uses the 8155 boot clock")
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args(argv)
     cv2.setNumThreads(2)
@@ -332,7 +335,7 @@ def main(argv=None):
         width, height = (v*2 for v in world.rig.image_size)
     if (width, height) not in ((2560, 1920), (1280, 960)):
         p.error("AIS stream requires 1280x960 or 640x480 per camera")
-    sock, output, encoder, frame_log = None, None, None, None
+    sock, output, encoder, frame_log, clock = None, None, None, None, None
     try:
         if world:
             # Build GL shaders / KB textures before assigning live frame PTS.
@@ -352,14 +355,21 @@ def main(argv=None):
             frame_log = args.frame_log.open("w", buffering=1)
         start_ns = time.monotonic_ns()
         transport_emit = emit
+        if not args.file and not args.local_clock:
+            clock = BoardClock(args.serial, args.port + 1)
+            print("8155 clock mapped rtt_us=%d board_us=%d" % (clock.rtt_us, clock.now_us()),
+                  flush=True)
+
+        source_times = {}
 
         def timed_emit(packet):
             transport_emit(packet)
             if frame_log:
                 header = HEADER.unpack_from(packet)
                 frame_log.write(json.dumps(dict(seq=header[6],
-                    source_ns=start_ns + header[7]*1000,
+                    source_ns=source_times.pop(header[6], None), pts_us=header[7],
                     sent_ns=time.monotonic_ns(), bytes=len(packet),
+                    clock="8155-boot" if clock else "tx2-local",
                     pattern="sequence512" if args.sequence_pattern else None)) + "\n")
 
         encoder_cls = JetsonEncoder if args.encoder == "jetson" else Encoder
@@ -370,6 +380,9 @@ def main(argv=None):
             while not args.seconds or time.monotonic()-start < args.seconds:
                 tick_ns = time.monotonic_ns()
                 tick = tick_ns/1e9
+                render_us = clock.to_board_us(tick_ns//1000) if clock else (tick_ns-start_ns)//1000
+                if frame_log:
+                    source_times[seq] = tick_ns
                 if args.sequence_pattern:
                     image = np.empty((height, width, 3), dtype=np.uint8)
                     image[:] = sequence_color(seq)
@@ -384,8 +397,7 @@ def main(argv=None):
                     distance = 4*math.sin(.1*(tick-start)) if args.loop_motion else .4*(tick-start)
                     world.set_ego_pose(.5 + distance, 1.5, 0., 0.)
                     image = world.render_camera_grid()
-                if image is not None:
-                    encoder.push(seq, (tick_ns-start_ns)//1000, image)
+                encoder.push(seq, render_us, image)
                 seq += 1
                 now = time.monotonic()
                 if now-report >= 1:
@@ -405,6 +417,7 @@ def main(argv=None):
         if output: output.close()
         if frame_log: frame_log.close()
         if sock: sock.close()
+        if clock: clock.close()
         if world: world.release()
     return 0
 
